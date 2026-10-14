@@ -21,6 +21,10 @@ pub trait Backend: Send + Sync {
     fn save_commit(&self, commit: &Commit) -> Result<()>;
     fn main_ref(&self) -> Result<Option<String>>;
     fn update_main(&self, update: RefUpdate) -> Result<()>;
+    fn tags(&self) -> Result<Vec<Tag>>;
+    fn tag(&self, name: &str) -> Result<Option<Tag>>;
+    fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool>;
+    fn delete_tag(&self, name: &str) -> Result<bool>;
 }
 
 #[derive(Clone)]
@@ -116,6 +120,7 @@ impl Local {
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS commits (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, target TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS tags (name TEXT PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS headers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS changes (commit_id TEXT NOT NULL, path TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(commit_id, path));"
         )?;
@@ -251,6 +256,43 @@ impl Backend for Local {
                 row.get(0)
             })
             .optional()?)
+    }
+
+    fn tags(&self) -> Result<Vec<Tag>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT data FROM tags ORDER BY name")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    fn tag(&self, name: &str) -> Result<Option<Tag>> {
+        let data: Option<String> = self
+            .connection()?
+            .query_row("SELECT data FROM tags WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        data.map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+
+    fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool> {
+        let sql = if force {
+            "INSERT INTO tags (name, data) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET data = excluded.data"
+        } else {
+            "INSERT OR IGNORE INTO tags (name, data) VALUES (?1, ?2)"
+        };
+        Ok(self
+            .connection()?
+            .execute(sql, params![tag.name, serde_json::to_string(tag)?])?
+            > 0)
+    }
+
+    fn delete_tag(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .connection()?
+            .execute("DELETE FROM tags WHERE name = ?1", [name])?
+            > 0)
     }
 
     fn update_main(&self, update: RefUpdate) -> Result<()> {

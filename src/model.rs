@@ -57,6 +57,59 @@ pub struct RefUpdate {
     pub target: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Tag {
+    pub name: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<TagAnnotation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TagAnnotation {
+    pub tagger: String,
+    pub message: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TagRequest {
+    pub name: String,
+    pub target: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub annotation: Option<TagAnnotationRequest>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TagAnnotationRequest {
+    pub tagger: String,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub enum TagError {
+    Exists(String),
+    NotFound(String),
+}
+
+impl std::fmt::Display for TagError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exists(name) => write!(
+                formatter,
+                "tag already exists: {name}; use --force to replace it"
+            ),
+            Self::NotFound(name) => write!(formatter, "tag not found: {name}"),
+        }
+    }
+}
+
+impl std::error::Error for TagError {}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct IntegrateRequest {
     pub head: String,
@@ -95,6 +148,35 @@ pub fn validate_id(id: &str) -> Result<()> {
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
         "invalid object id: {id}"
+    );
+    Ok(())
+}
+
+pub fn validate_git_id(id: &str) -> Result<()> {
+    ensure!(
+        matches!(id.len(), 40 | 64)
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "invalid Git object id"
+    );
+    Ok(())
+}
+
+pub fn validate_tag_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && !name.starts_with('-')
+            && !name.ends_with('.')
+            && !name.contains("..")
+            && !name.contains("@{")
+            && !name
+                .bytes()
+                .any(|byte| byte <= b' ' || byte == 127 || b"~^:?*[\\".contains(&byte))
+            && name
+                .split('/')
+                .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock")),
+        "invalid tag name: {name:?}"
     );
     Ok(())
 }

@@ -84,12 +84,12 @@ impl Client {
     }
 
     pub async fn commit(&self, revision: &str) -> Result<Commit> {
-        validate_revision(revision)?;
+        let revision = revision_segment(revision)?;
         self.get(&format!("/v1/commits/{revision}"), &[]).await
     }
 
     pub async fn tree(&self, revision: &str, sparse: &[String]) -> Result<Tree> {
-        validate_revision(revision)?;
+        let revision = revision_segment(revision)?;
         let route = format!("/v1/tree/{revision}");
         if sparse.is_empty() {
             return self.get(&route, &[]).await;
@@ -202,6 +202,27 @@ impl Client {
         self.update_main(expected, target).await
     }
 
+    pub async fn tags(&self) -> Result<Vec<Tag>> {
+        self.get("/v1/tags", &[]).await
+    }
+
+    pub async fn tag(&self, name: &str) -> Result<Tag> {
+        validate_tag_name(name)?;
+        self.get(&format!("/v1/tags/{}", revision_segment(name)?), &[])
+            .await
+    }
+
+    pub async fn delete_tag(&self, name: &str) -> Result<()> {
+        validate_tag_name(name)?;
+        let response = self
+            .http
+            .delete(format!("{}/v1/tags/{}", self.url, revision_segment(name)?))
+            .send()
+            .await?;
+        Self::response(response).await?;
+        Ok(())
+    }
+
     pub async fn update_main(&self, expected: Option<String>, target: String) -> Result<()> {
         let response = self
             .http
@@ -215,9 +236,13 @@ impl Client {
 }
 
 pub fn validate_revision(revision: &str) -> Result<()> {
-    if revision == "main" {
-        Ok(())
-    } else {
-        validate_id(revision)
-    }
+    validate_tag_name(revision.strip_prefix("refs/tags/").unwrap_or(revision))
+}
+
+pub fn revision_segment(revision: &str) -> Result<String> {
+    validate_revision(revision)?;
+    Ok(
+        percent_encoding::utf8_percent_encode(revision, percent_encoding::NON_ALPHANUMERIC)
+            .to_string(),
+    )
 }

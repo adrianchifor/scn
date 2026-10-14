@@ -17,7 +17,12 @@ pub(crate) struct ApiError(pub StatusCode, pub String);
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        Self(StatusCode::BAD_REQUEST, format!("{error:#}"))
+        let status = match error.downcast_ref::<TagError>() {
+            Some(TagError::Exists(_)) => StatusCode::CONFLICT,
+            Some(TagError::NotFound(_)) => StatusCode::NOT_FOUND,
+            None => StatusCode::BAD_REQUEST,
+        };
+        Self(status, format!("{error:#}"))
     }
 }
 
@@ -41,10 +46,13 @@ pub fn router(store: Store) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/refs/main", get(main_ref).post(update_main))
+        .route("/v1/tags", get(tags).post(create_tag))
+        .route("/v1/tags/{*name}", get(tag).delete(delete_tag))
         .route("/v1/blobs", post(put_blob))
         .route("/v1/blobs/{id}", get(get_blob))
         .route("/v1/commits", post(create_commit))
         .route("/v1/import/commits", post(import_commit))
+        .route("/v1/import/tags", post(import_tag))
         .route("/v1/commits/{revision}", get(get_commit))
         .route("/v1/tree/{revision}", get(tree))
         .route("/v1/log/{revision}", get(log))
@@ -76,6 +84,36 @@ async fn main_ref(State(store): State<Store>) -> Result<Json<RefValue>, ApiError
     Ok(Json(RefValue {
         target: blocking(store, |s| s.main_ref()).await?,
     }))
+}
+
+async fn tags(State(store): State<Store>) -> Result<Json<Vec<Tag>>, ApiError> {
+    Ok(Json(blocking(store, |s| s.tags()).await?))
+}
+
+async fn tag(State(store): State<Store>, Path(name): Path<String>) -> Result<Json<Tag>, ApiError> {
+    Ok(Json(blocking(store, move |s| s.tag(&name)).await?))
+}
+
+async fn create_tag(
+    State(store): State<Store>,
+    Json(request): Json<TagRequest>,
+) -> Result<Json<Tag>, ApiError> {
+    Ok(Json(blocking(store, move |s| s.create_tag(request)).await?))
+}
+
+async fn import_tag(
+    State(store): State<Store>,
+    Json(tag): Json<Tag>,
+) -> Result<Json<Tag>, ApiError> {
+    Ok(Json(blocking(store, move |s| s.import_tag(tag)).await?))
+}
+
+async fn delete_tag(
+    State(store): State<Store>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    blocking(store, move |s| s.delete_tag(&name)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn update_main(

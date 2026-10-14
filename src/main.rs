@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use scn::{
+    client::{Client, revision_segment},
     model::*,
     server,
     store::{Store, patch},
@@ -89,8 +90,28 @@ enum RemoteCommand {
     },
 }
 
+#[derive(Args)]
+struct TagArgs {
+    #[arg(value_name = "NAME_OR_REV")]
+    names: Vec<String>,
+    #[arg(short = 'l', long, conflicts_with_all = ["delete", "force", "annotate", "message", "author"])]
+    list: bool,
+    #[arg(short = 'd', long, conflicts_with_all = ["force", "annotate", "message", "author"])]
+    delete: bool,
+    #[arg(short = 'f', long)]
+    force: bool,
+    #[arg(short = 'a', long, requires = "message")]
+    annotate: bool,
+    #[arg(short = 'm', long)]
+    message: Option<String>,
+    #[arg(long, requires = "message")]
+    author: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Create, list, replace, or delete shared tags")]
+    Tag(TagArgs),
     #[command(about = "Run a SQLite storage shard or shard controller")]
     Shard(ShardArgs),
     #[command(about = "Run Valkey with AOF, RDB, and volatile-lru eviction")]
@@ -241,6 +262,53 @@ fn author(value: Option<String>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+async fn tags(args: TagArgs, workspace: &Workspace, client: &Client) -> Result<()> {
+    if args.list || args.names.is_empty() {
+        ensure!(
+            !args.delete && !args.force && !args.annotate && args.message.is_none(),
+            "a tag name is required"
+        );
+        let mut patterns = globset::GlobSetBuilder::new();
+        for pattern in &args.names {
+            patterns.add(globset::Glob::new(pattern)?);
+        }
+        let patterns = patterns.build()?;
+        for tag in client.tags().await? {
+            if args.names.is_empty() || patterns.is_match(&tag.name) {
+                println!("{}", tag.name);
+            }
+        }
+    } else if args.delete {
+        for name in args.names {
+            client.delete_tag(&name).await?;
+            println!("Deleted tag '{name}'");
+        }
+    } else {
+        ensure!(
+            args.names.len() <= 2,
+            "usage: scn tag [-a -m MESSAGE] [-f] NAME [REV]"
+        );
+        let target = workspace.revision(args.names.get(1).map(String::as_str).unwrap_or("HEAD"))?;
+        let annotation = args.message.map(|message| TagAnnotationRequest {
+            tagger: author(args.author),
+            message,
+        });
+        let tag: Tag = client
+            .post(
+                "/v1/tags",
+                &TagRequest {
+                    name: args.names[0].clone(),
+                    target,
+                    force: args.force,
+                    annotation,
+                },
+            )
+            .await?;
+        println!("{} -> {}", tag.name, tag.target);
+    }
+    Ok(())
+}
+
 fn print_diff(
     path: &str,
     before: Option<&FileEntry>,
@@ -362,6 +430,7 @@ async fn main() -> Result<()> {
     let client = workspace.client()?;
     let rebase = matches!(&command, Command::Rebase { .. });
     match command {
+        Command::Tag(args) => tags(args, &workspace, &client).await?,
         Command::Status => {
             let files = workspace.scan()?;
             let index = workspace.staged_tree();
@@ -429,8 +498,8 @@ async fn main() -> Result<()> {
         }
         Command::Diff { from, to, cached } => {
             if let (Some(from), Some(to)) = (from, to) {
-                let from = workspace.revision(&from)?;
-                let to = workspace.revision(&to)?;
+                let from = revision_segment(&workspace.revision(&from)?)?;
+                let to = revision_segment(&workspace.revision(&to)?)?;
                 let diff: Vec<DiffEntry> =
                     client.get(&format!("/v1/diff/{from}/{to}"), &[]).await?;
                 for entry in diff {
@@ -495,7 +564,7 @@ async fn main() -> Result<()> {
                 println!("No changesets");
                 return Ok(());
             }
-            let revision = workspace.revision(&revision)?;
+            let revision = revision_segment(&workspace.revision(&revision)?)?;
             let mut query = vec![("limit", limit.to_string())];
             if let Some(path) = path {
                 validate_path(&path)?;
@@ -528,7 +597,7 @@ async fn main() -> Result<()> {
         }
         Command::Blame { path, rev } => {
             validate_path(&path)?;
-            let revision = workspace.revision(&rev)?;
+            let revision = revision_segment(&workspace.revision(&rev)?)?;
             let lines: Vec<BlameLine> = client
                 .get(&format!("/v1/blame/{revision}"), &[("path", path)])
                 .await?;

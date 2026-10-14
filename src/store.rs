@@ -117,9 +117,88 @@ impl Store {
         if revision == "main" {
             self.main_ref()?
                 .context("main is empty; commit and land a changeset first")
-        } else {
+        } else if let Some(name) = revision.strip_prefix("refs/tags/") {
+            Ok(self.tag(name)?.target)
+        } else if validate_id(revision).is_ok() {
             Ok(self.get_commit(revision)?.id)
+        } else {
+            Ok(self.tag(revision)?.target)
         }
+    }
+
+    pub fn tags(&self) -> Result<Vec<Tag>> {
+        let mut tags = self.backend.tags()?;
+        tags.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(tags)
+    }
+
+    pub fn tag(&self, name: &str) -> Result<Tag> {
+        validate_tag_name(name)?;
+        self.backend
+            .tag(name)?
+            .ok_or_else(|| TagError::NotFound(name.to_owned()).into())
+    }
+
+    pub fn create_tag(&self, request: TagRequest) -> Result<Tag> {
+        validate_tag_name(&request.name)?;
+        let target = self.resolve(&request.target)?;
+        let annotation = request
+            .annotation
+            .map(|annotation| {
+                ensure!(
+                    !annotation.message.trim().is_empty(),
+                    "tag message must not be empty"
+                );
+                Ok::<_, anyhow::Error>(TagAnnotation {
+                    tagger: annotation.tagger,
+                    message: annotation.message,
+                    timestamp: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)?
+                        .as_nanos()
+                        .try_into()?,
+                })
+            })
+            .transpose()?;
+        let tag = Tag {
+            name: request.name,
+            target,
+            annotation,
+            git_id: None,
+        };
+        self.write_tag(tag, request.force, false)
+    }
+
+    pub fn import_tag(&self, tag: Tag) -> Result<Tag> {
+        self.write_tag(tag, false, true)
+    }
+
+    fn write_tag(&self, tag: Tag, force: bool, imported: bool) -> Result<Tag> {
+        validate_tag_name(&tag.name)?;
+        self.parents(&tag.target)?;
+        if let Some(annotation) = &tag.annotation {
+            ensure!(
+                !annotation.tagger.trim().is_empty(),
+                "tagger must not be empty"
+            );
+        }
+        if let Some(id) = &tag.git_id {
+            validate_git_id(id)?;
+        }
+        if !self.backend.save_tag(&tag, force)?
+            && !(imported && self.backend.tag(&tag.name)?.as_ref() == Some(&tag))
+        {
+            return Err(TagError::Exists(tag.name).into());
+        }
+        Ok(tag)
+    }
+
+    pub fn delete_tag(&self, name: &str) -> Result<()> {
+        validate_tag_name(name)?;
+        ensure!(
+            self.backend.delete_tag(name)?,
+            TagError::NotFound(name.to_owned())
+        );
+        Ok(())
     }
 
     pub fn tree(&self, id: &str) -> Result<Tree> {
@@ -155,14 +234,7 @@ impl Store {
     }
 
     pub fn import_commit(&self, request: ImportCommitRequest) -> Result<Commit> {
-        ensure!(
-            matches!(request.git_id.len(), 40 | 64)
-                && request
-                    .git_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-            "invalid Git commit id"
-        );
+        validate_git_id(&request.git_id)?;
         self.write_commit(request.commit, request.timestamp, Some(request.git_id))
     }
 

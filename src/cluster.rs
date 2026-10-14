@@ -249,6 +249,35 @@ impl Backend for Cluster {
         Ok(self.connection()?.get(self.key("main"))?)
     }
 
+    fn tags(&self) -> Result<Vec<Tag>> {
+        let values: Vec<String> = self.connection()?.hvals(self.key("tags"))?;
+        values
+            .into_iter()
+            .map(|value| Ok(serde_json::from_str(&value)?))
+            .collect()
+    }
+
+    fn tag(&self, name: &str) -> Result<Option<Tag>> {
+        let data: Option<String> = self.connection()?.hget(self.key("tags"), name)?;
+        data.map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+
+    fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let data = serde_json::to_string(tag)?;
+        if force {
+            connection.hset::<_, _, _, ()>(self.key("tags"), &tag.name, data)?;
+            Ok(true)
+        } else {
+            Ok(connection.hset_nx(self.key("tags"), &tag.name, data)?)
+        }
+    }
+
+    fn delete_tag(&self, name: &str) -> Result<bool> {
+        Ok(self.connection()?.hdel(self.key("tags"), name)?)
+    }
+
     fn update_main(&self, update: RefUpdate) -> Result<()> {
         let changed: bool = redis::Script::new("local current = redis.call('GET', KEYS[1]) or ''; if current ~= ARGV[1] then return 0 end; redis.call('SET', KEYS[1], ARGV[2]); return 1")
             .key(self.key("main")).arg(update.expected.unwrap_or_default()).arg(update.target).invoke(&mut self.connection()?)?;

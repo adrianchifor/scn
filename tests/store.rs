@@ -45,6 +45,18 @@ impl Backend for CountingBackend {
     fn update_main(&self, update: RefUpdate) -> Result<()> {
         self.local.update_main(update)
     }
+    fn tags(&self) -> Result<Vec<Tag>> {
+        self.local.tags()
+    }
+    fn tag(&self, name: &str) -> Result<Option<Tag>> {
+        self.local.tag(name)
+    }
+    fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool> {
+        self.local.save_tag(tag, force)
+    }
+    fn delete_tag(&self, name: &str) -> Result<bool> {
+        self.local.delete_tag(name)
+    }
 }
 
 #[test]
@@ -371,4 +383,92 @@ fn blobs_use_only_zstandard_and_verify_contents() {
     std::fs::write(directory.path().join("blobs").join(&id), other).unwrap();
     assert!(store.blob(&id).is_err());
     assert!(store.compressed_blob(&id).is_err());
+}
+
+#[test]
+fn tags_are_atomic_persistent_and_require_explicit_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let root = change(&store, &[], "root", &[("a", Some("root"))]);
+    let next = change(&store, &[&root.id], "next", &[("a", Some("next"))]);
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = [&root.id, &next.id]
+        .into_iter()
+        .map(|target| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let target = target.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .create_tag(TagRequest {
+                        name: "release/v1".into(),
+                        target,
+                        force: false,
+                        annotation: None,
+                    })
+                    .is_ok()
+            })
+        })
+        .collect();
+    assert_eq!(
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap() as usize)
+            .sum::<usize>(),
+        1
+    );
+    let tag = store.tag("release/v1").unwrap();
+    assert_eq!(
+        Store::open(directory.path())
+            .unwrap()
+            .tag(&tag.name)
+            .unwrap(),
+        tag
+    );
+    let annotated = store
+        .create_tag(TagRequest {
+            name: "release/v1".into(),
+            target: next.id.clone(),
+            force: true,
+            annotation: Some(TagAnnotationRequest {
+                tagger: "Adrian".into(),
+                message: "Release".into(),
+            }),
+        })
+        .unwrap();
+    assert_eq!(store.resolve("release/v1").unwrap(), next.id);
+    assert!(annotated.annotation.unwrap().timestamp > 0);
+    assert!(store.main_ref().unwrap().is_none());
+    store
+        .create_tag(TagRequest {
+            name: "main".into(),
+            target: root.id.clone(),
+            force: false,
+            annotation: None,
+        })
+        .unwrap();
+    assert_eq!(store.resolve("refs/tags/main").unwrap(), root.id);
+    assert!(store.resolve("main").is_err());
+    assert_eq!(
+        store
+            .tags()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>(),
+        ["main", "release/v1"]
+    );
+    for name in [
+        "", "-bad", "a..b", "a@{b", "a b", "a\n", "a\\b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b",
+        "/a", "a/", "a//b", ".hidden", "a/.b", "a.lock", "a.lock/b", "a.",
+    ] {
+        assert!(validate_tag_name(name).is_err(), "{name:?}");
+    }
+    for name in ["v1.0", "releases/α+β#%", "main", "HEAD", &root.id] {
+        validate_tag_name(name).unwrap();
+    }
+    store.delete_tag("release/v1").unwrap();
+    assert!(store.tag("release/v1").is_err());
+    assert!(store.delete_tag("release/v1").is_err());
 }

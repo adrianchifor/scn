@@ -84,6 +84,21 @@ struct GitCommit {
     message: String,
 }
 
+fn parse_identity(value: &str) -> Result<(String, u64)> {
+    let mut fields = value.rsplitn(3, ' ');
+    fields.next().context("missing Git identity timezone")?;
+    let seconds: u64 = fields
+        .next()
+        .context("missing Git identity timestamp")?
+        .parse()
+        .context("Git timestamp must be non-negative")?;
+    let timestamp = seconds
+        .checked_mul(1_000_000_000)
+        .context("Git timestamp is out of range")?;
+    let identity = fields.next().context("missing Git identity")?.to_owned();
+    Ok((identity, timestamp))
+}
+
 fn parse_commit(bytes: &[u8]) -> Result<GitCommit> {
     let text = std::str::from_utf8(bytes).context("Git commit metadata must be UTF-8")?;
     let (headers, message) = text.split_once("\n\n").context("invalid Git commit")?;
@@ -99,26 +114,88 @@ fn parse_commit(bytes: &[u8]) -> Result<GitCommit> {
         .lines()
         .find_map(|line| line.strip_prefix("author "))
         .context("missing Git author")?;
-    let mut fields = author.rsplitn(3, ' ');
-    fields.next().context("missing Git author timezone")?;
-    let seconds: u64 = fields
-        .next()
-        .context("missing Git author timestamp")?
-        .parse()
-        .context("Git author timestamp must be non-negative")?;
-    let timestamp = seconds
-        .checked_mul(1_000_000_000)
-        .context("Git author timestamp is out of range")?;
-    let author = fields
-        .next()
-        .context("missing Git author identity")?
-        .to_owned();
+    let (author, timestamp) = parse_identity(author)?;
     Ok(GitCommit {
         parents,
         author,
         timestamp,
         message: message.to_owned(),
     })
+}
+
+fn git_tags(repository: &Path, objects: &mut Objects) -> Result<Vec<Tag>> {
+    let refs = String::from_utf8(run(
+        repository,
+        &[
+            "for-each-ref",
+            "--format=%(refname:strip=2)%00%(objectname)%00%(objecttype)",
+            "refs/tags/",
+        ],
+    )?)
+    .context("Git tag names must be UTF-8")?;
+    let mut tags = Vec::new();
+    for record in refs.lines() {
+        let fields: Vec<_> = record.split('\0').collect();
+        ensure!(fields.len() == 3, "invalid Git tag ref");
+        let (name, id, object_type) = (fields[0], fields[1], fields[2]);
+        validate_tag_name(name)?;
+        let mut target = id.to_owned();
+        let mut kind = object_type.to_owned();
+        let mut annotation = None;
+        while kind == "tag" {
+            let bytes = objects.read(&target, "tag")?;
+            let text = std::str::from_utf8(&bytes).context("Git tag metadata must be UTF-8")?;
+            let (headers, message) = text.split_once("\n\n").context("invalid Git tag object")?;
+            let field = |prefix: &str| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .with_context(|| format!("missing Git tag {prefix}"))
+            };
+            target = field("object ")?.to_owned();
+            validate_git_id(&target)?;
+            kind = field("type ")?.to_owned();
+            if annotation.is_none() {
+                let (tagger, timestamp) = parse_identity(field("tagger ")?)?;
+                annotation = Some(TagAnnotation {
+                    tagger,
+                    timestamp,
+                    message: message.to_owned(),
+                });
+            }
+        }
+        ensure!(kind == "commit", "tag {name} must point to a commit");
+        tags.push(Tag {
+            name: name.to_owned(),
+            target,
+            annotation,
+            git_id: (object_type == "tag").then(|| id.to_owned()),
+        });
+    }
+    Ok(tags)
+}
+
+fn git_history(repository: &Path, revision: &str, tags: &[Tag]) -> Result<String> {
+    let mut child = git(repository)
+        .args(["rev-list", "--reverse", "--topo-order", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "{revision}")?;
+        for tag in tags {
+            writeln!(input, "{}", tag.target)?;
+        }
+    }
+    let output = child.wait_with_output()?;
+    ensure!(
+        output.status.success(),
+        "git rev-list: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> Result<Commit> {
@@ -141,11 +218,9 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
     )?)?
     .trim()
     .to_owned();
-    let history = String::from_utf8(run(
-        repository,
-        &["rev-list", "--reverse", "--topo-order", &revision, "--"],
-    )?)?;
     let mut objects = Objects::open(repository)?;
+    let tags = git_tags(repository, &mut objects)?;
+    let history = git_history(repository, &revision, &tags)?;
     let mut commits = HashMap::<String, String>::new();
     let mut blobs = HashMap::<String, String>::new();
     let mut tip = None;
@@ -226,9 +301,18 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
             .await?;
         println!("{id} -> {}", commit.id);
         commits.insert(id.to_owned(), commit.id.clone());
-        tip = Some(commit);
+        if id == revision {
+            tip = Some(commit);
+        }
     }
     let tip = tip.context("Git revision has no commits")?;
+    for mut tag in tags {
+        tag.target = commits
+            .get(&tag.target)
+            .context("missing imported tag target")?
+            .clone();
+        client.post::<Tag>("/v1/import/tags", &tag).await?;
+    }
     client.update_main(None, tip.id.clone()).await?;
     Ok(tip)
 }

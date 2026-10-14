@@ -166,6 +166,19 @@ async fn controllers_share_shards_and_concurrent_main_updates_are_atomic() {
         .unwrap();
     client.land(root.id.clone()).await.unwrap();
     let other = Client::new(&second.url, &directory.path().join("cache")).unwrap();
+    let tag = TagRequest {
+        name: "release/v1".into(),
+        target: root.id.clone(),
+        force: false,
+        annotation: None,
+    };
+    let (left_tag, right_tag) = tokio::join!(
+        client.post::<Tag>("/v1/tags", &tag),
+        other.post::<Tag>("/v1/tags", &tag)
+    );
+    assert_eq!(left_tag.is_ok() as usize + right_tag.is_ok() as usize, 1);
+    assert_eq!(other.commit("release/v1").await.unwrap().id, root.id);
+    assert_eq!(other.tags().await.unwrap(), client.tags().await.unwrap());
     assert_eq!(other.tree(&root.id, &[]).await.unwrap(), work.state.files);
     let local_a = Local::open(
         &directory.path().join("a"),
@@ -240,7 +253,7 @@ async fn controllers_share_shards_and_concurrent_main_updates_are_atomic() {
         .unwrap();
     assert_eq!(other.tree(&rebased.id, &[]).await.unwrap(), tree);
     let mut connection = index(&cache.url);
-    for key in ["paths", "blobs", "commits", "main", "paths:counts"] {
+    for key in ["paths", "blobs", "commits", "main", "paths:counts", "tags"] {
         assert_eq!(
             connection
                 .ttl::<_, i64>(format!("scn:{{test}}:{key}"))
@@ -281,6 +294,21 @@ async fn new_shards_take_new_paths_without_rebalancing_and_index_survives_restar
         .await
         .unwrap();
     client.land(next.id.clone()).await.unwrap();
+    let tag: Tag = client
+        .post(
+            "/v1/tags",
+            &TagRequest {
+                name: "persisted".into(),
+                target: next.id.clone(),
+                force: false,
+                annotation: Some(TagAnnotationRequest {
+                    tagger: "author".into(),
+                    message: "release".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
     let after: BTreeMap<String, String> = index(&cache.url).hgetall("scn:{test}:paths").unwrap();
     for (path, shard) in &before {
         assert_eq!(&after[path], shard);
@@ -298,6 +326,8 @@ async fn new_shards_take_new_paths_without_rebalancing_and_index_survives_restar
     let third = controller(&cache.url, vec![], 60).await;
     let other = Client::new(&third.url, &directory.path().join("cache")).unwrap();
     assert_eq!(other.main_ref().await.unwrap(), Some(next.id.clone()));
+    assert_eq!(other.tag("persisted").await.unwrap(), tag);
+    assert_eq!(other.commit("persisted").await.unwrap().id, next.id);
     assert_eq!(other.tree(&next.id, &[]).await.unwrap(), work.state.files);
     assert!(cache.directory.path().join("dump.rdb").exists());
     assert!(cache.directory.path().join("appendonlydir").exists());
@@ -337,6 +367,36 @@ async fn compressed_blob_cache_is_shared_and_ttl_does_not_expire_the_index() {
     let client = Client::new(&first.url, &directory.path().join("cache")).unwrap();
     let id = client
         .put_blob_at(b"cached\n".to_vec(), Some("file"))
+        .await
+        .unwrap();
+    let commit: Commit = client
+        .post(
+            "/v1/commits",
+            &CommitRequest {
+                parents: vec![],
+                author: "a".into(),
+                message: "root".into(),
+                changes: Changes::from([(
+                    "file".into(),
+                    Some(FileEntry {
+                        blob: id.clone(),
+                        executable: false,
+                    }),
+                )]),
+            },
+        )
+        .await
+        .unwrap();
+    let tag: Tag = client
+        .post(
+            "/v1/tags",
+            &TagRequest {
+                name: "durable".into(),
+                target: commit.id,
+                force: false,
+                annotation: None,
+            },
+        )
         .await
         .unwrap();
     let key = format!("scn:{{test}}:blob:{id}");
@@ -406,4 +466,6 @@ async fn compressed_blob_cache_is_shared_and_ttl_does_not_expire_the_index() {
         shard.url
     );
     assert_eq!(connection.ttl::<_, i64>("scn:{test}:paths").unwrap(), -1);
+    assert_eq!(connection.ttl::<_, i64>("scn:{test}:tags").unwrap(), -1);
+    assert_eq!(client.tag("durable").await.unwrap(), tag);
 }

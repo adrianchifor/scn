@@ -781,3 +781,213 @@ async fn controller_endpoint_is_saved_and_can_be_changed_without_losing_work() {
     scn(&work, &["push"]);
     assert!(scn(&work, &["status"]).contains("clean"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_style_tags_work_in_cli_api_and_revision_routes() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    scn(root, &["clone", &server.url, "work"]);
+    let work = root.join("work");
+    fs::write(work.join("a"), "first\n").unwrap();
+    scn(&work, &["add", "."]);
+    scn(&work, &["commit", "-m", "first"]);
+    scn(&work, &["tag", "v1"]);
+    let name = "releases/α+β#%";
+    scn(&work, &["tag", "-a", name, "-m", "First release"]);
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let first = client.commit("v1").await.unwrap();
+    let tag = client.tag(name).await.unwrap();
+    assert_eq!(tag.target, first.id);
+    let annotation = tag.annotation.unwrap();
+    assert_eq!(annotation.tagger, "tester");
+    assert_eq!(annotation.message, "First release");
+    assert!(annotation.timestamp > 0);
+    assert!(client.main_ref().await.unwrap().is_none());
+    assert_eq!(
+        scn(&work, &["tag", "-l", "releases/*"]),
+        format!("{name}\n")
+    );
+    assert_eq!(scn(&work, &["show", name, "a"]), "first\n");
+    assert!(scn(&work, &["log", name]).contains(&first.id));
+    assert!(scn(&work, &["blame", "a", "--rev", name]).contains("first"));
+    assert_eq!(
+        client.tree(name, &[]).await.unwrap(),
+        client.tree(&first.id, &[]).await.unwrap()
+    );
+    assert!(!run(&work, &["tag", "v1"]).status.success());
+    assert!(!run(&work, &["tag", "-a", "no-message"]).status.success());
+    fs::write(work.join("a"), "second\n").unwrap();
+    scn(&work, &["commit", "-am", "second"]);
+    scn(&work, &["tag", "-f", "v1"]);
+    let second = client.commit("v1").await.unwrap();
+    assert_ne!(first.id, second.id);
+    assert!(scn(&work, &["diff", name, "v1"]).contains("+second"));
+    scn(&work, &["tag", "main"]);
+    assert_eq!(scn(&work, &["show", "refs/tags/main", "a"]), "second\n");
+    scn(&work, &["checkout", name]);
+    assert_eq!(fs::read_to_string(work.join("a")).unwrap(), "first\n");
+    scn(root, &["clone", &server.url, "tag-clone", "--rev", name]);
+    assert_eq!(
+        fs::read_to_string(root.join("tag-clone/a")).unwrap(),
+        "first\n"
+    );
+    let http = reqwest::Client::new();
+    let request = TagRequest {
+        name: "v1".into(),
+        target: first.id.clone(),
+        force: false,
+        annotation: None,
+    };
+    assert_eq!(
+        http.post(format!("{}/v1/tags", server.url))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    let invalid = TagRequest {
+        name: "../bad".into(),
+        ..request
+    };
+    assert_eq!(
+        http.post(format!("{}/v1/tags", server.url))
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    scn(&work, &["tag", "-d", "v1", name, "main"]);
+    assert!(scn(&work, &["tag"]).is_empty());
+    assert_eq!(
+        http.get(format!("{}/v1/tags/v1", server.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert!(!run(&work, &["tag", "-d", "v1"]).status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_import_preserves_all_commit_tags_annotations_and_detached_histories() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    fs::write(source.join("a"), "root").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "Root"]);
+    git(&source, &["tag", "v0"]);
+    git(&source, &["checkout", "-b", "side"]);
+    fs::write(source.join("a"), "side").unwrap();
+    git(&source, &["commit", "-am", "Side"]);
+    git(
+        &source,
+        &["tag", "-a", "releases/v1", "-m", "Release\n\nOriginal body"],
+    );
+    git(
+        &source,
+        &[
+            "tag",
+            "-a",
+            "nested",
+            "-m",
+            "Outer annotation",
+            "releases/v1",
+        ],
+    );
+    git(&source, &["checkout", "main"]);
+    fs::write(source.join("a"), "main").unwrap();
+    git(&source, &["commit", "-am", "Main"]);
+    git(root, &["clone", "--bare", "source", "bare"]);
+    scn(
+        root,
+        &[
+            "import-git",
+            "bare",
+            &server.url,
+            "--rev",
+            "refs/heads/main",
+        ],
+    );
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let main = client.commit("main").await.unwrap();
+    assert_eq!(main.message, "Main\n");
+    assert_eq!(
+        client
+            .tags()
+            .await
+            .unwrap()
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>(),
+        ["nested", "releases/v1", "v0"]
+    );
+    let lightweight = client.tag("v0").await.unwrap();
+    assert!(lightweight.annotation.is_none());
+    assert!(lightweight.git_id.is_none());
+    assert_eq!(client.commit("v0").await.unwrap().message, "Root\n");
+    for name in ["releases/v1", "nested"] {
+        let tag = client.tag(name).await.unwrap();
+        let original_id =
+            String::from_utf8(git(&source, &["rev-parse", &format!("refs/tags/{name}")]))
+                .unwrap()
+                .trim()
+                .to_owned();
+        let original = String::from_utf8(git(&source, &["cat-file", "tag", &original_id])).unwrap();
+        assert_eq!(tag.git_id.as_deref(), Some(original_id.as_str()));
+        let annotation = tag.annotation.as_ref().unwrap();
+        assert_eq!(annotation.message, original.split_once("\n\n").unwrap().1);
+        assert_eq!(
+            annotation.tagger,
+            "Original Committer <committer@example.com>"
+        );
+        assert_eq!(annotation.timestamp, 1_234_567_900_000_000_000);
+        assert_eq!(client.commit(name).await.unwrap().message, "Side\n");
+        assert_ne!(tag.target, main.id);
+        let retried: Tag = client.post("/v1/import/tags", &tag).await.unwrap();
+        assert_eq!(retried, tag);
+    }
+    assert_eq!(
+        client.commit("nested").await.unwrap().id,
+        client.commit("releases/v1").await.unwrap().id
+    );
+    let tag = client.tag("nested").await.unwrap();
+    let conflicting = Tag {
+        target: main.id.clone(),
+        ..tag.clone()
+    };
+    assert!(
+        client
+            .post::<Tag>("/v1/import/tags", &conflicting)
+            .await
+            .is_err()
+    );
+    assert_eq!(client.tag("nested").await.unwrap(), tag);
+    assert_eq!(client.main_ref().await.unwrap(), Some(main.id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_import_rejects_non_commit_tags_before_publishing_refs() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    fs::write(source.join("a"), "content").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "Root"]);
+    git(&source, &["tag", "blob-tag", "HEAD:a"]);
+    let output = run(root, &["import-git", "source", &server.url]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must point to a commit"));
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    assert!(client.main_ref().await.unwrap().is_none());
+    assert!(client.tags().await.unwrap().is_empty());
+}
