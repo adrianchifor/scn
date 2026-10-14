@@ -15,6 +15,9 @@ pub trait Backend: Send + Sync {
     fn blob(&self, id: &str) -> Result<Vec<u8>>;
     fn has_blob(&self, id: &str) -> Result<bool>;
     fn get_commit(&self, id: &str) -> Result<Commit>;
+    fn parents(&self, id: &str) -> Result<Vec<String>> {
+        Ok(self.get_commit(id)?.parents)
+    }
     fn save_commit(&self, commit: &Commit) -> Result<()>;
     fn main_ref(&self) -> Result<Option<String>>;
     fn update_main(&self, update: RefUpdate) -> Result<()>;
@@ -217,6 +220,18 @@ impl Backend for Local {
             .query_row("SELECT data FROM commits WHERE id = ?1", [id], |row| {
                 row.get(0)
             })
+            .context("changeset not found")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    fn parents(&self, id: &str) -> Result<Vec<String>> {
+        let data: String = self
+            .connection()?
+            .query_row(
+                "SELECT json_extract(data, '$.parents') FROM commits WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
             .context("changeset not found")?;
         Ok(serde_json::from_str(&data)?)
     }

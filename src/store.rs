@@ -6,15 +6,60 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::Read,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const MAX_BLOB: usize = 32 * 1024 * 1024;
+const TREE_CACHE_LIMIT: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct TreeCache {
+    entries: VecDeque<(String, Arc<Tree>, usize)>,
+    size: usize,
+}
+
+impl TreeCache {
+    fn get(&mut self, id: &str) -> Option<Arc<Tree>> {
+        let index = self.entries.iter().position(|(key, _, _)| key == id)?;
+        let entry = self.entries.remove(index)?;
+        let tree = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(tree)
+    }
+
+    fn insert(&mut self, id: &str, tree: Tree) {
+        if self.get(id).is_some() {
+            return;
+        }
+        let size = id.len()
+            + tree
+                .iter()
+                .map(|(path, entry)| {
+                    path.capacity()
+                        + entry.blob.capacity()
+                        + std::mem::size_of::<(String, FileEntry)>()
+                        + 32
+                })
+                .sum::<usize>();
+        if size > TREE_CACHE_LIMIT {
+            return;
+        }
+        while self.entries.len() >= 8 || self.size + size > TREE_CACHE_LIMIT {
+            if let Some((_, _, size)) = self.entries.pop_front() {
+                self.size -= size;
+            }
+        }
+        self.size += size;
+        self.entries
+            .push_back((id.to_owned(), Arc::new(tree), size));
+    }
+}
 
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn Backend>,
+    trees: Arc<Mutex<TreeCache>>,
 }
 
 impl Store {
@@ -27,7 +72,10 @@ impl Store {
     }
 
     pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            trees: Arc::default(),
+        }
     }
 
     pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
@@ -52,7 +100,8 @@ impl Store {
     }
 
     pub fn blob(&self, id: &str) -> Result<Vec<u8>> {
-        decode_blob(&self.compressed_blob(id)?, id)
+        validate_id(id)?;
+        decode_blob(&self.backend.blob(id)?, id)
     }
 
     pub fn get_commit(&self, id: &str) -> Result<Commit> {
@@ -76,15 +125,24 @@ impl Store {
     pub fn tree(&self, id: &str) -> Result<Tree> {
         let mut chain = Vec::new();
         let mut current = Some(id.to_owned());
+        let mut tree = Tree::new();
         while let Some(id) = current {
+            let cached = self.trees.lock().unwrap().get(&id);
+            if let Some(cached) = cached {
+                tree = (*cached).clone();
+                break;
+            }
             let commit = self.get_commit(&id)?;
             current = commit.parents.first().cloned();
             chain.push(commit);
         }
-        let mut tree = Tree::new();
+        if chain.is_empty() {
+            return Ok(tree);
+        }
         for commit in chain.into_iter().rev() {
             apply(&mut tree, &commit.changes);
         }
+        self.trees.lock().unwrap().insert(id, tree.clone());
         Ok(tree)
     }
 
@@ -131,8 +189,8 @@ impl Store {
             !request.author.trim().is_empty(),
             "author must not be empty"
         );
-        for parent in &request.parents {
-            self.get_commit(parent)?;
+        for parent in request.parents.iter().skip(1) {
+            self.parents(parent)?;
         }
         let mut tree = match request.parents.first() {
             Some(parent) => self.tree(parent)?,
@@ -154,10 +212,13 @@ impl Store {
                 );
             }
         }
-        let before = tree.clone();
-        apply(&mut tree, &request.changes);
+        let changes: Changes = request
+            .changes
+            .into_iter()
+            .filter(|(path, entry)| tree.get(path) != entry.as_ref())
+            .collect();
+        apply(&mut tree, &changes);
         validate_tree(&tree)?;
-        let changes = changes_between(&before, &tree);
         ensure!(
             imported || !changes.is_empty() || request.parents.len() == 2,
             "nothing to commit"
@@ -173,6 +234,7 @@ impl Store {
         };
         commit.id = hash(&serde_json::to_vec(&commit)?);
         self.backend.save_commit(&commit)?;
+        self.trees.lock().unwrap().insert(&commit.id, tree);
         Ok(commit)
     }
 
@@ -187,26 +249,42 @@ impl Store {
         self.backend.update_main(update)
     }
 
-    fn ancestors(&self, head: &str) -> Result<BTreeMap<String, usize>> {
+    fn parents(&self, id: &str) -> Result<Vec<String>> {
+        validate_id(id)?;
+        self.backend.parents(id)
+    }
+
+    fn ancestors(&self, head: &str) -> Result<BTreeMap<String, Vec<String>>> {
         let mut result = BTreeMap::new();
-        let mut queue = VecDeque::from([(head.to_owned(), 0)]);
-        while let Some((id, distance)) = queue.pop_front() {
+        let mut queue = VecDeque::from([head.to_owned()]);
+        while let Some(id) = queue.pop_front() {
             if result.contains_key(&id) {
                 continue;
             }
-            queue.extend(
-                self.get_commit(&id)?
-                    .parents
-                    .into_iter()
-                    .map(|parent| (parent, distance + 1)),
-            );
-            result.insert(id, distance);
+            let parents = self.parents(&id)?;
+            queue.extend(parents.iter().cloned());
+            result.insert(id, parents);
         }
         Ok(result)
     }
 
     pub fn is_ancestor(&self, ancestor: &str, head: &str) -> Result<bool> {
-        Ok(self.ancestors(head)?.contains_key(ancestor))
+        validate_id(ancestor)?;
+        let parents = self.parents(head)?;
+        if head == ancestor {
+            return Ok(true);
+        }
+        let mut seen = BTreeSet::from([head.to_owned()]);
+        let mut queue = VecDeque::from(parents);
+        while let Some(id) = queue.pop_front() {
+            if id == ancestor {
+                return Ok(true);
+            }
+            if seen.insert(id.clone()) {
+                queue.extend(self.parents(&id)?);
+            }
+        }
+        Ok(false)
     }
 
     pub fn merge_base(&self, left: &str, right: &str) -> Result<String> {
@@ -219,8 +297,8 @@ impl Store {
             .collect();
         let mut best = common.clone();
         for id in &common {
-            for parent in self.get_commit(id)?.parents {
-                best.remove(&parent);
+            for parent in &left[id] {
+                best.remove(parent);
             }
         }
         ensure!(

@@ -1,8 +1,101 @@
-use scn::{model::*, store::Store};
+use anyhow::Result;
+use scn::{
+    model::*,
+    storage::{Backend, Blobs, Local},
+    store::Store,
+};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+struct CountingBackend {
+    local: Local,
+    commits: AtomicUsize,
+    parents: AtomicUsize,
+}
+
+impl Backend for CountingBackend {
+    fn put_blob(&self, id: &str, bytes: &[u8], path: Option<&str>) -> Result<()> {
+        self.local.put_blob(id, bytes, path)
+    }
+    fn blob(&self, id: &str) -> Result<Vec<u8>> {
+        self.local.blob(id)
+    }
+    fn has_blob(&self, id: &str) -> Result<bool> {
+        self.local.has_blob(id)
+    }
+    fn get_commit(&self, id: &str) -> Result<Commit> {
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        self.local.get_commit(id)
+    }
+    fn parents(&self, id: &str) -> Result<Vec<String>> {
+        self.parents.fetch_add(1, Ordering::Relaxed);
+        self.local.parents(id)
+    }
+    fn save_commit(&self, commit: &Commit) -> Result<()> {
+        self.local.save_commit(commit)
+    }
+    fn main_ref(&self) -> Result<Option<String>> {
+        self.local.main_ref()
+    }
+    fn update_main(&self, update: RefUpdate) -> Result<()> {
+        self.local.update_main(update)
+    }
+}
+
+#[test]
+fn tree_cache_avoids_history_replay_and_rebuilds_evicted_revisions() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = Arc::new(CountingBackend {
+        local: Local::open(
+            directory.path(),
+            Blobs::disk(&directory.path().join("blobs")).unwrap(),
+        )
+        .unwrap(),
+        commits: AtomicUsize::new(0),
+        parents: AtomicUsize::new(0),
+    });
+    let store = Store::with_backend(backend.clone());
+    let mut head = change(&store, &[], "root", &[("a", Some("initial"))]);
+    let mut history = vec![head.id.clone()];
+    for n in 0..20 {
+        head = change(&store, &[&head.id], "next", &[("a", Some(&n.to_string()))]);
+        history.push(head.id.clone());
+    }
+    assert_eq!(backend.commits.load(Ordering::Relaxed), 0);
+    let reader = Store::with_backend(backend.clone());
+    let expected = store.tree(&head.id).unwrap();
+    assert_eq!(reader.tree(&head.id).unwrap(), expected);
+    assert_eq!(backend.commits.load(Ordering::Relaxed), history.len());
+    reader.clone().tree(&head.id).unwrap().clear();
+    assert_eq!(reader.tree(&head.id).unwrap(), expected);
+    assert_eq!(backend.commits.load(Ordering::Relaxed), history.len());
+    let next = change(
+        &store,
+        &[&head.id],
+        "delete",
+        &[("a", None), ("b", Some("new"))],
+    );
+    assert_eq!(
+        reader.tree(&next.id).unwrap(),
+        store.tree(&next.id).unwrap()
+    );
+    assert_eq!(backend.commits.load(Ordering::Relaxed), history.len() + 1);
+    for id in history {
+        assert_eq!(reader.tree(&id).unwrap(), store.tree(&id).unwrap());
+    }
+    backend.parents.store(0, Ordering::Relaxed);
+    backend.commits.store(0, Ordering::Relaxed);
+    assert!(reader.is_ancestor(&head.id, &next.id).unwrap());
+    assert_eq!(backend.parents.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.commits.load(Ordering::Relaxed), 0);
+    let missing = "0".repeat(64);
+    assert!(reader.is_ancestor(&missing, &missing).is_err());
+}
 
 fn change(
     store: &Store,
@@ -275,4 +368,7 @@ fn blobs_use_only_zstandard_and_verify_contents() {
     assert!(scn::store::decode_blob(b"invalid frame", &id).is_err());
     let other = scn::store::encode_blob(b"different contents").unwrap();
     assert!(scn::store::decode_blob(&other, &id).is_err());
+    std::fs::write(directory.path().join("blobs").join(&id), other).unwrap();
+    assert!(store.blob(&id).is_err());
+    assert!(store.compressed_blob(&id).is_err());
 }

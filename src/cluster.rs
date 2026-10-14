@@ -202,6 +202,16 @@ impl Backend for Cluster {
         Ok(commit)
     }
 
+    fn parents(&self, id: &str) -> Result<Vec<String>> {
+        let shard = self.owner("commits", id)?.context("changeset not found")?;
+        let stored: StoredCommit = self.get(&shard, &format!("/internal/commits/{id}"))?;
+        ensure!(
+            stored.commit.id == id && stored.commit.changes.is_empty(),
+            "invalid changeset header"
+        );
+        Ok(stored.commit.parents)
+    }
+
     fn save_commit(&self, commit: &Commit) -> Result<()> {
         let mut groups: BTreeMap<String, Changes> = BTreeMap::new();
         for (path, entry) in &commit.changes {
