@@ -20,12 +20,12 @@ Its stateless controllers, SQLite shards, and S3 storage can potentially scale t
 Requires Docker with Compose. From this repository:
 
 ```sh
-docker compose up --build -d --wait
-docker compose ps
+docker compose -f deploy/compose.yaml up --build -d --wait
+docker compose -f deploy/compose.yaml ps
 curl --fail http://127.0.0.1:7878/health
 ```
 
-[compose.yaml](compose.yaml) starts two controllers behind an Nginx gateway, two SQLite shards, persistent Valkey, and [RustFS](https://docs.rustfs.com/en/installation/container/docker), an S3-compatible store. An initialization job creates the `scn` bucket before shards start.
+[deploy/compose.yaml](deploy/compose.yaml) starts two controllers behind an Nginx gateway, two SQLite shards, persistent Valkey, and [RustFS](https://docs.rustfs.com/en/installation/container/docker), an S3-compatible store. An initialization job creates the `scn` bucket before shards start.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -38,11 +38,11 @@ Local S3 credentials default to `SCNLOCAL` / `scn-local-secret-change-me`. Overr
 Each shard has its own volume. Valkey and S3 also have persistent volumes. Inspect or stop the stack with:
 
 ```sh
-docker compose logs -f controller-a shard-a
-docker compose down
+docker compose -f deploy/compose.yaml logs -f controller-a shard-a
+docker compose -f deploy/compose.yaml down
 ```
 
-`down` keeps data. `docker compose down -v` deletes the repository, index, and blobs.
+`down` keeps data. `docker compose -f deploy/compose.yaml down -v` deletes the repository, index, and blobs.
 
 ## Point the CLI at a controller
 
@@ -172,12 +172,12 @@ scn import-git /path/to/git-repo http://127.0.0.1:7878 --rev main
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-SCN_VALKEY_SERVER=valkey-server cargo test --test cluster -- --ignored
-docker compose config --quiet
-cargo run --release --example perf -- 500
+SCN_VALKEY_SERVER=valkey-server cargo test --release --test cluster -- --ignored
+docker compose -f deploy/compose.yaml config --quiet
+SCN_PERF_COMMITS=500 cargo test --release --test perf -- --ignored --nocapture
 cargo test --release --test large_files -- --ignored
 ```
 
 Tests cover cluster persistence, eviction, concurrent writes, S3 requests, and chunked files. The separate large-file test streams 5 GiB of repeated data with bounded buffers and deduplication.
 
-The local performance example accepts a total commit count (default 500). It measures sequential commits, warm tree reads, direct-parent checks, and 1 MiB blob reads. Cluster throughput also depends on network latency and Valkey persistence settings.
+The local performance test uses `SCN_PERF_COMMITS` for the total commit count (default 500). It measures sequential commits, warm tree reads, direct-parent checks, and 1 MiB blob reads. Cluster throughput also depends on network latency and Valkey persistence settings.

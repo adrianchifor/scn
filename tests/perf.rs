@@ -2,9 +2,11 @@ use anyhow::Result;
 use scn::{model::*, store::Store};
 use std::{hint::black_box, time::Instant};
 
-fn main() -> Result<()> {
-    let count: usize = std::env::args()
-        .nth(1)
+#[test]
+#[ignore = "local performance measurements; run with --release --ignored --nocapture"]
+fn local_performance() -> Result<()> {
+    let count: usize = std::env::var("SCN_PERF_COMMITS")
+        .ok()
         .unwrap_or_else(|| "500".into())
         .parse()?;
     anyhow::ensure!(count >= 2, "at least two commits are required");
