@@ -1,7 +1,8 @@
 use crate::{
     client::Client,
+    content::read_entry,
     model::*,
-    store::{MAX_BLOB, decode_blob, encode_blob},
+    store::{decode_blob, encode_blob},
 };
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -244,15 +245,12 @@ impl Workspace {
             metadata.is_file(),
             "only regular files are supported: {path}"
         );
-        ensure!(
-            metadata.len() <= MAX_BLOB as u64,
-            "file exceeds 32 MiB limit: {path}"
-        );
-        let bytes = fs::read(full)?;
-        Ok(FileEntry {
-            blob: hash(&bytes),
-            executable: executable(&metadata),
-        })
+        read_entry(
+            fs::File::open(full)?,
+            metadata.len(),
+            executable(&metadata),
+            |_, _| Ok(()),
+        )
     }
 
     pub fn ensure_clean(&self) -> Result<()> {
@@ -330,14 +328,22 @@ impl Workspace {
                 }
                 let entry = files.get(&path).cloned();
                 if let Some(entry) = &entry {
-                    let bytes = fs::read(self.path(&path)?)?;
+                    let file = fs::File::open(self.path(&path)?)?;
+                    let metadata = file.metadata()?;
+                    let mut saved = std::collections::BTreeSet::new();
+                    let staged =
+                        read_entry(file, metadata.len(), executable(&metadata), |id, bytes| {
+                            if saved.insert(id.to_owned()) {
+                                let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
+                                temp.write_all(&encode_blob(bytes)?)?;
+                                temp.persist(directory.join(id))?;
+                            }
+                            Ok(())
+                        })?;
                     ensure!(
-                        hash(&bytes) == entry.blob,
+                        staged == *entry,
                         "file changed while staging; retry: {path}"
                     );
-                    let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
-                    temp.write_all(&encode_blob(&bytes)?)?;
-                    temp.persist(directory.join(&entry.blob))?;
                 }
                 index.insert(path, entry);
             }
@@ -365,7 +371,7 @@ impl Workspace {
             .index
             .values()
             .flatten()
-            .map(|entry| entry.blob.as_str())
+            .flat_map(FileEntry::blobs)
             .collect();
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
@@ -390,11 +396,25 @@ impl Workspace {
         let files = self.staged_tree();
         let changes = self.state.index.clone();
         ensure!(!changes.is_empty(), "nothing to commit; use scn add first");
+        let mut uploaded = std::collections::BTreeSet::new();
         for (path, entry) in &changes {
             if let Some(entry) = entry {
-                client
-                    .put_blob_at(self.staged_blob(&entry.blob)?, Some(path))
-                    .await?;
+                for id in entry.blobs() {
+                    if uploaded.insert(id)
+                        && (entry.manifest.is_none() || !client.has_blob(id).await?)
+                    {
+                        client
+                            .put_blob_at(
+                                self.staged_blob(id)?,
+                                if entry.manifest.is_some() {
+                                    None
+                                } else {
+                                    Some(path)
+                                },
+                            )
+                            .await?;
+                    }
+                }
             }
         }
         let commit: Commit = client
@@ -504,21 +524,27 @@ impl Workspace {
         for (path, entry) in &changes {
             if let Some(entry) = entry {
                 downloads
-                    .entry(&entry.blob)
+                    .entry((&entry.blob, &entry.manifest))
                     .or_default()
-                    .push((path, entry.executable));
+                    .push((path, entry));
             }
         }
         stream::iter(downloads)
-            .map(|(blob, paths)| {
+            .map(|(_, paths)| {
                 let stage = stage.path();
                 async move {
-                    let bytes = client.blob(blob).await?;
-                    for (path, executable) in paths {
+                    let first = stage.join(paths[0].0);
+                    fs::create_dir_all(first.parent().unwrap())?;
+                    let mut file = fs::File::create(&first)?;
+                    client.write_file(paths[0].1, &mut file).await?;
+                    file.flush()?;
+                    for (path, entry) in paths {
                         let staged = stage.join(path);
                         fs::create_dir_all(staged.parent().unwrap())?;
-                        fs::write(&staged, &bytes)?;
-                        set_executable(&staged, executable)?;
+                        if staged != first {
+                            fs::copy(&first, &staged)?;
+                        }
+                        set_executable(&staged, entry.executable)?;
                     }
                     Ok::<_, anyhow::Error>(())
                 }

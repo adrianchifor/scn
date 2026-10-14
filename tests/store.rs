@@ -123,6 +123,7 @@ fn change(
                 text.map(|text| FileEntry {
                     blob: store.put_blob(text.as_bytes()).unwrap(),
                     executable: false,
+                    manifest: None,
                 }),
             )
         })
@@ -330,6 +331,7 @@ fn invalid_objects_and_file_directory_collisions_are_rejected() {
     let entry = FileEntry {
         blob: store.put_blob(b"content").unwrap(),
         executable: false,
+        manifest: None,
     };
     let request = |changes| CommitRequest {
         parents: vec![root.id.clone()],
@@ -356,7 +358,8 @@ fn invalid_objects_and_file_directory_collisions_are_rejected() {
                 "missing".into(),
                 Some(FileEntry {
                     blob: "0".repeat(64),
-                    executable: false
+                    executable: false,
+                    manifest: None,
                 })
             )])))
             .is_err()

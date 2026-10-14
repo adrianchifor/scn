@@ -11,6 +11,7 @@ use scn::{
 use std::{
     collections::BTreeMap,
     fs,
+    io::{self, Read},
     net::TcpListener,
     path::Path,
     process::{Child, Command, Stdio},
@@ -209,6 +210,7 @@ async fn controllers_share_shards_and_concurrent_main_updates_are_atomic() {
             Some(FileEntry {
                 blob,
                 executable: false,
+                manifest: None,
             }),
         )]),
     };
@@ -381,6 +383,7 @@ async fn compressed_blob_cache_is_shared_and_ttl_does_not_expire_the_index() {
                     Some(FileEntry {
                         blob: id.clone(),
                         executable: false,
+                        manifest: None,
                     }),
                 )]),
             },
@@ -468,4 +471,57 @@ async fn compressed_blob_cache_is_shared_and_ttl_does_not_expire_the_index() {
     assert_eq!(connection.ttl::<_, i64>("scn:{test}:paths").unwrap(), -1);
     assert_eq!(connection.ttl::<_, i64>("scn:{test}:tags").unwrap(), -1);
     assert_eq!(client.tag("durable").await.unwrap(), tag);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires valkey-server; set SCN_VALKEY_SERVER and run with --ignored"]
+async fn large_file_chunks_span_shards_and_survive_controller_restart() {
+    let cache = tokio::task::spawn_blocking(Valkey::start).await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let first = start_shard(&directory.path().join("first")).await;
+    let second = start_shard(&directory.path().join("second")).await;
+    let api = controller(&cache.url, vec![first.url.clone(), second.url.clone()], 60).await;
+    let client = Client::new(&api.url, &directory.path().join("cache")).unwrap();
+    let chunk = scn::content::CHUNK_SIZE as u64;
+    let source = io::repeat(1)
+        .take(chunk)
+        .chain(io::repeat(2).take(chunk))
+        .chain(io::repeat(1).take(chunk * 2))
+        .chain(io::repeat(3).take(17));
+    let entry = client
+        .put_file(source, chunk * 4 + 17, false, Some("large"))
+        .await
+        .unwrap();
+    let commit: Commit = client
+        .post(
+            "/v1/commits",
+            &CommitRequest {
+                parents: vec![],
+                author: "tester".into(),
+                message: "large".into(),
+                changes: Changes::from([("large".into(), Some(entry.clone()))]),
+            },
+        )
+        .await
+        .unwrap();
+    let owners: BTreeMap<String, String> = index(&cache.url).hgetall("scn:{test}:blobs").unwrap();
+    assert_eq!(
+        owners
+            .values()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2
+    );
+    api.task.abort();
+    let cache = tokio::task::spawn_blocking(move || cache.restart())
+        .await
+        .unwrap();
+    let restarted = controller(&cache.url, vec![], 60).await;
+    let other = Client::new(&restarted.url, &directory.path().join("other-cache")).unwrap();
+    let tree = other.tree(&commit.id, &[]).await.unwrap();
+    assert_eq!(tree["large"], entry);
+    other
+        .write_file(&tree["large"], &mut io::sink())
+        .await
+        .unwrap();
 }

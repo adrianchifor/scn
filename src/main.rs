@@ -7,13 +7,7 @@ use scn::{
     store::{Store, patch},
     workspace::Workspace,
 };
-use std::{
-    fs,
-    io::{self, Write},
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
 #[command(name = "scn", version, about = "Small, centralized source control")]
@@ -321,7 +315,9 @@ fn print_diff(
     }
     match patch {
         Some(patch) => print!("{patch}"),
-        None if before.map(|entry| &entry.blob) != after.map(|entry| &entry.blob) => {
+        None if before.map(|entry| (&entry.blob, &entry.manifest))
+            != after.map(|entry| (&entry.blob, &entry.manifest)) =>
+        {
             println!("Binary files differ")
         }
         None => {}
@@ -527,6 +523,12 @@ async fn main() -> Result<()> {
                 };
                 for (path, entry) in changes_between(base, &files) {
                     let before = base.get(&path);
+                    if before.is_some_and(|entry| entry.manifest.is_some())
+                        || entry.as_ref().is_some_and(|entry| entry.manifest.is_some())
+                    {
+                        print_diff(&path, before, entry.as_ref(), None);
+                        continue;
+                    }
                     let old = if let Some(before) = before {
                         if !cached
                             && workspace
@@ -588,9 +590,7 @@ async fn main() -> Result<()> {
                 validate_path(&path)?;
                 let tree = client.tree(&commit.id, std::slice::from_ref(&path)).await?;
                 let entry = tree.get(&path).context("file not found in this revision")?;
-                io::stdout()
-                    .lock()
-                    .write_all(&client.blob(&entry.blob).await?)?;
+                client.write_file(entry, &mut io::stdout().lock()).await?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&commit)?);
             }

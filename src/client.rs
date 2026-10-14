@@ -1,10 +1,14 @@
-use crate::{model::*, store::decode_blob};
+use crate::{
+    content::{CHUNK_SIZE, FileReader, validate_entry},
+    model::*,
+    store::{MAX_BLOB, decode_blob},
+};
 use anyhow::{Context, Result, ensure};
 use reqwest::{Client as HttpClient, Response};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime},
@@ -107,6 +111,58 @@ impl Client {
 
     pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
         self.put_blob_at(bytes, None).await
+    }
+
+    pub async fn put_file(
+        &self,
+        reader: impl Read,
+        size: u64,
+        executable: bool,
+        path: Option<&str>,
+    ) -> Result<FileEntry> {
+        let mut reader = FileReader::new(reader, size);
+        let mut uploaded = std::collections::BTreeSet::new();
+        while let Some((id, bytes)) = reader.next_blob()? {
+            if uploaded.insert(id.clone())
+                && (size <= MAX_BLOB as u64 || !self.has_blob(&id).await?)
+            {
+                self.put_blob_at(bytes, if size > MAX_BLOB as u64 { None } else { path })
+                    .await?;
+            }
+        }
+        reader.finish(executable)
+    }
+
+    pub async fn has_blob(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        let response = self
+            .http
+            .head(format!("{}/v1/blobs/{id}", self.url))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        Self::response(response).await?;
+        Ok(true)
+    }
+
+    pub async fn write_file(&self, entry: &FileEntry, output: &mut impl Write) -> Result<()> {
+        validate_entry(entry)?;
+        let mut written = 0;
+        for id in entry.blobs() {
+            let bytes = self.blob(id).await?;
+            if let Some(manifest) = &entry.manifest {
+                let expected = (manifest.size - written).min(CHUNK_SIZE as u64);
+                ensure!(
+                    bytes.len() as u64 == expected,
+                    "file chunk size mismatch: {id}"
+                );
+            }
+            output.write_all(&bytes)?;
+            written += bytes.len() as u64;
+        }
+        Ok(())
     }
 
     pub async fn put_blob_at(&self, bytes: Vec<u8>, path: Option<&str>) -> Result<String> {

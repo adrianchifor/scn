@@ -49,7 +49,8 @@ pub fn router(store: Store) -> Router {
         .route("/v1/tags", get(tags).post(create_tag))
         .route("/v1/tags/{*name}", get(tag).delete(delete_tag))
         .route("/v1/blobs", post(put_blob))
-        .route("/v1/blobs/{id}", get(get_blob))
+        .route("/v1/files", post(prepare_file))
+        .route("/v1/blobs/{id}", get(get_blob).head(has_blob))
         .route("/v1/commits", post(create_commit))
         .route("/v1/import/commits", post(import_commit))
         .route("/v1/import/tags", post(import_tag))
@@ -156,11 +157,31 @@ async fn get_blob(
         .into_response())
 }
 
+async fn has_blob(
+    State(store): State<Store>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    Ok(if blocking(store, move |s| s.has_blob(&id)).await? {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
 async fn create_commit(
     State(store): State<Store>,
     Json(request): Json<CommitRequest>,
 ) -> Result<Json<Commit>, ApiError> {
     Ok(Json(blocking(store, |s| s.create_commit(request)).await?))
+}
+
+async fn prepare_file(
+    State(store): State<Store>,
+    Json(request): Json<FileRequest>,
+) -> Result<Json<FileEntry>, ApiError> {
+    Ok(Json(
+        blocking(store, move |s| s.prepare_file(request)).await?,
+    ))
 }
 
 async fn import_commit(

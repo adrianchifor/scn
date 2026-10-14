@@ -38,6 +38,10 @@ impl TreeCache {
                 .map(|(path, entry)| {
                     path.capacity()
                         + entry.blob.capacity()
+                        + entry.manifest.as_ref().map_or(0, |manifest| {
+                            manifest.chunks.capacity() * std::mem::size_of::<String>()
+                                + manifest.chunks.iter().map(String::capacity).sum::<usize>()
+                        })
                         + std::mem::size_of::<(String, FileEntry)>()
                         + 32
                 })
@@ -99,9 +103,51 @@ impl Store {
         Ok(bytes)
     }
 
+    pub fn has_blob(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        self.backend.has_blob(id)
+    }
+
     pub fn blob(&self, id: &str) -> Result<Vec<u8>> {
         validate_id(id)?;
         decode_blob(&self.backend.blob(id)?, id)
+    }
+
+    pub fn prepare_file(&self, request: FileRequest) -> Result<FileEntry> {
+        let entry = crate::content::manifest_entry(request.manifest, request.executable)?;
+        self.check_file(&entry, &mut BTreeMap::new())?;
+        Ok(entry)
+    }
+
+    fn check_file<'a>(
+        &self,
+        entry: &'a FileEntry,
+        checked: &mut BTreeMap<&'a str, Option<usize>>,
+    ) -> Result<()> {
+        crate::content::validate_entry(entry)?;
+        if let Some(manifest) = &entry.manifest {
+            for (index, id) in manifest.chunks.iter().enumerate() {
+                let length = match checked.get(id.as_str()).copied().flatten() {
+                    Some(length) => length,
+                    None => {
+                        let length = self.blob(id)?.len();
+                        checked.insert(id, Some(length));
+                        length
+                    }
+                };
+                let expected = (manifest.size - index as u64 * crate::content::CHUNK_SIZE as u64)
+                    .min(crate::content::CHUNK_SIZE as u64);
+                ensure!(length as u64 == expected, "file chunk size mismatch: {id}");
+            }
+        } else if !checked.contains_key(entry.blob.as_str()) {
+            ensure!(
+                self.backend.has_blob(&entry.blob)?,
+                "missing blob: {}",
+                entry.blob
+            );
+            checked.insert(&entry.blob, None);
+        }
+        Ok(())
     }
 
     pub fn get_commit(&self, id: &str) -> Result<Commit> {
@@ -268,15 +314,11 @@ impl Store {
             Some(parent) => self.tree(parent)?,
             None => Tree::new(),
         };
+        let mut checked_blobs = BTreeMap::new();
         for (path, entry) in &request.changes {
             validate_path(path)?;
             if let Some(entry) = entry {
-                validate_id(&entry.blob)?;
-                ensure!(
-                    self.backend.has_blob(&entry.blob)?,
-                    "missing blob: {}",
-                    entry.blob
-                );
+                self.check_file(entry, &mut checked_blobs)?;
             } else {
                 ensure!(
                     tree.contains_key(path),
@@ -408,6 +450,16 @@ impl Store {
             .into_iter()
             .map(|(path, entry)| {
                 let old = before.get(&path).cloned();
+                if old.as_ref().is_some_and(|entry| entry.manifest.is_some())
+                    || entry.as_ref().is_some_and(|entry| entry.manifest.is_some())
+                {
+                    return Ok(DiffEntry {
+                        path,
+                        before: old,
+                        after: entry,
+                        patch: None,
+                    });
+                }
                 let old_bytes = old
                     .as_ref()
                     .map(|entry| self.blob(&entry.blob))
@@ -488,15 +540,25 @@ impl Store {
 
     pub fn blame(&self, head: &str, path: &str) -> Result<Vec<BlameLine>> {
         validate_path(path)?;
+        let tree = self.tree(head)?;
+        let entry = tree
+            .get(path)
+            .with_context(|| format!("path not found: {path}"))?;
         ensure!(
-            self.tree(head)?.contains_key(path),
-            "path not found: {path}"
+            entry.manifest.is_none(),
+            "blame is unavailable for files over 32 MiB"
         );
         let mut history = self.log(head, usize::MAX, Some(path))?;
         history.reverse();
         let mut text = String::new();
         let mut lines: Vec<BlameLine> = Vec::new();
         for commit in history {
+            ensure!(
+                commit.changes[path]
+                    .as_ref()
+                    .is_none_or(|entry| entry.manifest.is_none()),
+                "blame is unavailable for files over 32 MiB"
+            );
             let bytes = commit.changes[path]
                 .as_ref()
                 .map(|entry| self.blob(&entry.blob))

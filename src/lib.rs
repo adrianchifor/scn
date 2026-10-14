@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod client;
 pub mod cluster;
+pub mod content;
 pub mod import;
 pub mod model;
 pub mod server;

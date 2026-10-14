@@ -18,6 +18,7 @@ fn main() -> Result<()> {
                 Some(FileEntry {
                     blob: blob.clone(),
                     executable: false,
+                    manifest: None,
                 }),
             )
         })
@@ -42,6 +43,7 @@ fn main() -> Result<()> {
                 Some(FileEntry {
                     blob,
                     executable: false,
+                    manifest: None,
                 }),
             )]),
         })?;

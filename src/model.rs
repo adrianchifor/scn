@@ -10,6 +10,33 @@ pub type Changes = BTreeMap<String, Option<FileEntry>>;
 pub struct FileEntry {
     pub blob: String,
     pub executable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<FileManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileManifest {
+    pub size: u64,
+    pub chunks: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FileRequest {
+    #[serde(flatten)]
+    pub manifest: FileManifest,
+    #[serde(default)]
+    pub executable: bool,
+}
+
+impl FileEntry {
+    pub fn blobs(&self) -> impl Iterator<Item = &str> {
+        self.manifest
+            .as_ref()
+            .map(|manifest| manifest.chunks.as_slice())
+            .unwrap_or(std::slice::from_ref(&self.blob))
+            .iter()
+            .map(String::as_str)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -196,7 +223,8 @@ pub fn validate_path(path: &str) -> Result<()> {
 }
 
 pub fn validate_tree(tree: &Tree) -> Result<()> {
-    for path in tree.keys() {
+    for (path, entry) in tree {
+        crate::content::validate_entry(entry)?;
         validate_path(path)?;
         for (index, _) in path.match_indices('/') {
             if tree.contains_key(&path[..index]) {

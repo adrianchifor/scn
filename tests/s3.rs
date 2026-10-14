@@ -15,6 +15,7 @@ use scn::{
 };
 use std::{
     collections::BTreeMap,
+    io::{self, Read},
     sync::{Arc, Mutex},
 };
 
@@ -92,6 +93,11 @@ async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files(
     });
     let client = Client::new(&url, &directory.path().join("cache")).unwrap();
     let id = client.put_blob(b"S3 content\n".to_vec()).await.unwrap();
+    let size = scn::store::MAX_BLOB as u64 + 1;
+    let large = client
+        .put_file(io::repeat(9).take(size), size, false, Some("large"))
+        .await
+        .unwrap();
     let commit: Commit = client
         .post(
             "/v1/commits",
@@ -99,19 +105,32 @@ async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files(
                 parents: vec![],
                 author: "author".into(),
                 message: "S3".into(),
-                changes: Changes::from([(
-                    "file".into(),
-                    Some(FileEntry {
-                        blob: id.clone(),
-                        executable: false,
-                    }),
-                )]),
+                changes: Changes::from([
+                    (
+                        "file".into(),
+                        Some(FileEntry {
+                            blob: id.clone(),
+                            executable: false,
+                            manifest: None,
+                        }),
+                    ),
+                    ("large".into(), Some(large.clone())),
+                ]),
             },
         )
         .await
         .unwrap();
     client.land(commit.id).await.unwrap();
     assert_eq!(client.blob(&id).await.unwrap(), b"S3 content\n");
+    client.write_file(&large, &mut io::sink()).await.unwrap();
+    for id in large.blobs() {
+        assert!(
+            objects
+                .lock()
+                .unwrap()
+                .contains_key(&format!("repository/blobs/{id}.zst"))
+        );
+    }
     assert!(
         objects
             .lock()

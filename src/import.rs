@@ -49,7 +49,7 @@ impl Objects {
         })
     }
 
-    fn read(&mut self, id: &str, kind: &str) -> Result<Vec<u8>> {
+    fn header(&mut self, id: &str, kind: &str) -> Result<u64> {
         writeln!(self.input, "{id}")?;
         self.input.flush()?;
         let mut header = String::new();
@@ -59,14 +59,35 @@ impl Objects {
             fields.len() == 3 && fields[0] == id && fields[1] == kind,
             "invalid or missing Git object: {id}"
         );
-        let size: usize = fields[2].parse()?;
-        ensure!(size <= MAX_BLOB, "Git object exceeds 32 MiB limit: {id}");
-        let mut bytes = vec![0; size];
-        self.output.read_exact(&mut bytes)?;
+        Ok(fields[2].parse()?)
+    }
+
+    fn newline(&mut self) -> Result<()> {
         let mut newline = [0];
         self.output.read_exact(&mut newline)?;
         ensure!(newline == *b"\n", "invalid Git batch response");
+        Ok(())
+    }
+
+    fn read(&mut self, id: &str, kind: &str) -> Result<Vec<u8>> {
+        let size = self.header(id, kind)?;
+        ensure!(
+            size <= MAX_BLOB as u64,
+            "Git metadata exceeds 32 MiB limit: {id}"
+        );
+        let size = size as usize;
+        let mut bytes = vec![0; size];
+        self.output.read_exact(&mut bytes)?;
+        self.newline()?;
         Ok(bytes)
+    }
+
+    async fn upload_blob(&mut self, client: &Client, id: &str, path: &str) -> Result<FileEntry> {
+        let size = self.header(id, "blob")?;
+        let reader = std::io::Read::by_ref(&mut self.output).take(size);
+        let entry = client.put_file(reader, size, false, Some(path)).await?;
+        self.newline()?;
+        Ok(entry)
     }
 }
 
@@ -222,7 +243,7 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
     let tags = git_tags(repository, &mut objects)?;
     let history = git_history(repository, &revision, &tags)?;
     let mut commits = HashMap::<String, String>::new();
-    let mut blobs = HashMap::<String, String>::new();
+    let mut blobs = HashMap::<String, FileEntry>::new();
     let mut tip = None;
     for id in history.lines() {
         let original = parse_commit(&objects.read(id, "commit")?)
@@ -254,19 +275,16 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
                 "000000" => None,
                 "100644" | "100755" => {
                     let git_blob = fields[3];
-                    let blob = match blobs.get(git_blob) {
-                        Some(blob) => blob.clone(),
+                    let mut entry = match blobs.get(git_blob) {
+                        Some(entry) => entry.clone(),
                         None => {
-                            let bytes = objects.read(git_blob, "blob")?;
-                            let blob = client.put_blob_at(bytes, Some(path)).await?;
-                            blobs.insert(git_blob.to_owned(), blob.clone());
-                            blob
+                            let entry = objects.upload_blob(client, git_blob, path).await?;
+                            blobs.insert(git_blob.to_owned(), entry.clone());
+                            entry
                         }
                     };
-                    Some(FileEntry {
-                        blob,
-                        executable: fields[1] == "100755",
-                    })
+                    entry.executable = fields[1] == "100755";
+                    Some(entry)
                 }
                 mode => anyhow::bail!(
                     "unsupported Git file mode {mode} at {path} in {id}; symlinks and submodules are unsupported"

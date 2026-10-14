@@ -81,6 +81,7 @@ async fn checkout_downloads_unique_changed_blobs_with_bounded_concurrency() {
             Some(FileEntry {
                 blob,
                 executable: false,
+                manifest: None,
             }),
         );
     }
@@ -151,6 +152,7 @@ async fn checkout_downloads_unique_changed_blobs_with_bounded_concurrency() {
                         Some(FileEntry {
                             blob: blob.clone(),
                             executable: false,
+                            manifest: None,
                         }),
                     ),
                     ("file2".into(), None),
@@ -610,6 +612,7 @@ async fn checkout_handles_file_directory_transitions_and_protects_ignored_files(
                     Some(FileEntry {
                         blob,
                         executable: false,
+                        manifest: None,
                     }),
                 )]),
             },
