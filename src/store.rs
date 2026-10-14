@@ -92,7 +92,8 @@ impl Store {
             validate_path(path)?;
         }
         let id = hash(bytes);
-        self.backend.put_blob(&id, &encode_blob(bytes)?, path)?;
+        self.backend
+            .put_blob(&id, &encode_blob(bytes)?, bytes.len(), path)?;
         Ok(id)
     }
 
@@ -122,16 +123,19 @@ impl Store {
     fn check_file<'a>(
         &self,
         entry: &'a FileEntry,
-        checked: &mut BTreeMap<&'a str, Option<usize>>,
+        checked: &mut BTreeMap<&'a str, usize>,
     ) -> Result<()> {
         crate::content::validate_entry(entry)?;
         if let Some(manifest) = &entry.manifest {
             for (index, id) in manifest.chunks.iter().enumerate() {
-                let length = match checked.get(id.as_str()).copied().flatten() {
+                let length = match checked.get(id.as_str()).copied() {
                     Some(length) => length,
                     None => {
-                        let length = self.blob(id)?.len();
-                        checked.insert(id, Some(length));
+                        let length = self
+                            .backend
+                            .blob_size(id)?
+                            .with_context(|| format!("missing blob: {id}"))?;
+                        checked.insert(id, length);
                         length
                     }
                 };
@@ -140,12 +144,11 @@ impl Store {
                 ensure!(length as u64 == expected, "file chunk size mismatch: {id}");
             }
         } else if !checked.contains_key(entry.blob.as_str()) {
-            ensure!(
-                self.backend.has_blob(&entry.blob)?,
-                "missing blob: {}",
-                entry.blob
-            );
-            checked.insert(&entry.blob, None);
+            let size = self
+                .backend
+                .blob_size(&entry.blob)?
+                .with_context(|| format!("missing blob: {}", entry.blob))?;
+            checked.insert(&entry.blob, size);
         }
         Ok(())
     }
@@ -318,6 +321,9 @@ impl Store {
         for (path, entry) in &request.changes {
             validate_path(path)?;
             if let Some(entry) = entry {
+                if tree.get(path) == Some(entry) {
+                    continue;
+                }
                 self.check_file(entry, &mut checked_blobs)?;
             } else {
                 ensure!(

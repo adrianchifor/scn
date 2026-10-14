@@ -525,3 +525,111 @@ async fn large_file_chunks_span_shards_and_survive_controller_restart() {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "streams four concurrent 1 GiB files; requires Valkey; run with --release --ignored"]
+async fn concurrent_gibibyte_files_round_trip_across_controllers_and_shards() {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    struct Source {
+        remaining: u64,
+        state: u64,
+        digest: Sha256,
+    }
+
+    impl Read for Source {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let length = self.remaining.min(buffer.len() as u64) as usize;
+            for word in buffer[..length].chunks_mut(8) {
+                self.state ^= self.state << 13;
+                self.state ^= self.state >> 7;
+                self.state ^= self.state << 17;
+                word.copy_from_slice(&self.state.to_le_bytes()[..word.len()]);
+            }
+            self.digest.update(&buffer[..length]);
+            self.remaining -= length as u64;
+            Ok(length)
+        }
+    }
+
+    #[derive(Default)]
+    struct Sink {
+        digest: Sha256,
+        written: u64,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            assert!(bytes.len() <= scn::content::CHUNK_SIZE);
+            self.digest.update(bytes);
+            self.written += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let cache = tokio::task::spawn_blocking(Valkey::start).await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let a = start_shard(&directory.path().join("a")).await;
+    let b = start_shard(&directory.path().join("b")).await;
+    let first = controller(&cache.url, vec![a.url.clone(), b.url.clone()], 60).await;
+    let second = controller(&cache.url, vec![], 60).await;
+    let size = 1024 * 1024 * 1024;
+    let started = std::time::Instant::now();
+    let transfers = (0..4).map(|index| {
+        let endpoint = if index % 2 == 0 {
+            &first.url
+        } else {
+            &second.url
+        };
+        let cache = directory.path().join(format!("client-{index}"));
+        async move {
+            let client = Client::new(endpoint, &cache)?;
+            let mut source = Source {
+                remaining: size,
+                state: index + 1,
+                digest: Sha256::new(),
+            };
+            let entry = client.put_file(&mut source, size, false, None).await?;
+            assert_eq!(entry.manifest.as_ref().unwrap().chunks.len(), 128);
+            let prepared: FileEntry = client
+                .post(
+                    "/v1/files",
+                    &FileRequest {
+                        manifest: entry.manifest.clone().unwrap(),
+                        executable: false,
+                    },
+                )
+                .await?;
+            assert_eq!(prepared, entry);
+            let commit: Commit = client
+                .post(
+                    "/v1/commits",
+                    &CommitRequest {
+                        parents: vec![],
+                        author: "tester".into(),
+                        message: "concurrent upload".into(),
+                        changes: Changes::from([(format!("file-{index}"), Some(entry.clone()))]),
+                    },
+                )
+                .await?;
+            assert_eq!(
+                client.tree(&commit.id, &[]).await?[&format!("file-{index}")],
+                entry
+            );
+            let mut output = Sink::default();
+            client.write_file(&entry, &mut output).await?;
+            assert_eq!(output.written, size);
+            assert_eq!(output.digest.finalize(), source.digest.finalize());
+            Ok::<_, anyhow::Error>(())
+        }
+    });
+    futures_util::future::try_join_all(transfers).await.unwrap();
+    eprintln!(
+        "Four concurrent 1 GiB uploads, manifests, commits, and verified downloads in {:?}",
+        started.elapsed()
+    );
+}

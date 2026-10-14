@@ -11,9 +11,15 @@ use std::{
 };
 
 pub trait Backend: Send + Sync {
-    fn put_blob(&self, id: &str, bytes: &[u8], path: Option<&str>) -> Result<()>;
+    fn put_blob(&self, id: &str, bytes: &[u8], size: usize, path: Option<&str>) -> Result<()>;
     fn blob(&self, id: &str) -> Result<Vec<u8>>;
     fn has_blob(&self, id: &str) -> Result<bool>;
+    fn blob_size(&self, id: &str) -> Result<Option<usize>> {
+        if !self.has_blob(id)? {
+            return Ok(None);
+        }
+        Ok(Some(crate::store::decode_blob(&self.blob(id)?, id)?.len()))
+    }
     fn get_commit(&self, id: &str) -> Result<Commit>;
     fn parents(&self, id: &str) -> Result<Vec<String>> {
         Ok(self.get_commit(id)?.parents)
@@ -74,6 +80,7 @@ impl Blobs {
                 temp.write_all(bytes)?;
                 temp.as_file().sync_all()?;
                 temp.persist(directory.join(id))?;
+                fs::File::open(directory)?.sync_all()?;
             }
             Self::S3 { bucket, prefix } => {
                 bucket.put_object_with_content_type(
@@ -121,6 +128,7 @@ impl Local {
              CREATE TABLE IF NOT EXISTS commits (sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, target TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS tags (name TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, size INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS headers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS changes (commit_id TEXT NOT NULL, path TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(commit_id, path));"
         )?;
@@ -131,6 +139,16 @@ impl Local {
         let connection = Connection::open(self.root.join("scn.db"))?;
         connection.busy_timeout(Duration::from_secs(10))?;
         Ok(connection)
+    }
+
+    fn record_blob(&self, id: &str, size: usize) -> Result<()> {
+        validate_id(id)?;
+        ensure!(size <= crate::store::MAX_BLOB, "blob exceeds 32 MiB limit");
+        self.connection()?.execute(
+            "INSERT OR IGNORE INTO blobs (id, size) VALUES (?1, ?2)",
+            params![id, size as u32],
+        )?;
+        Ok(())
     }
 
     pub fn header(&self, id: &str) -> Result<StoredCommit> {
@@ -209,14 +227,34 @@ impl Local {
 }
 
 impl Backend for Local {
-    fn put_blob(&self, id: &str, bytes: &[u8], _: Option<&str>) -> Result<()> {
-        self.blobs.put(id, bytes)
+    fn put_blob(&self, id: &str, bytes: &[u8], size: usize, _: Option<&str>) -> Result<()> {
+        self.blobs.put(id, bytes)?;
+        self.record_blob(id, size)
     }
     fn blob(&self, id: &str) -> Result<Vec<u8>> {
         self.blobs.get(id)
     }
     fn has_blob(&self, id: &str) -> Result<bool> {
         self.blobs.contains(id)
+    }
+
+    fn blob_size(&self, id: &str) -> Result<Option<usize>> {
+        if !self.blobs.contains(id)? {
+            return Ok(None);
+        }
+        let size: Option<u32> = self
+            .connection()?
+            .query_row("SELECT size FROM blobs WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(size) = size {
+            ensure!(size as usize <= crate::store::MAX_BLOB, "invalid blob size");
+            return Ok(Some(size as usize));
+        }
+        let size = crate::store::decode_blob(&self.blobs.get(id)?, id)?.len();
+        self.record_blob(id, size)?;
+        Ok(Some(size))
     }
 
     fn get_commit(&self, id: &str) -> Result<Commit> {

@@ -1,7 +1,7 @@
 use crate::{
     model::*,
     server::{ApiError, ApiState, blocking, limit_requests},
-    storage::Local,
+    storage::{Backend, Local},
     store::{MAX_BLOB, decode_blob},
 };
 use axum::{
@@ -9,6 +9,7 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path},
     http::{StatusCode, header},
+    response::{IntoResponse, Response},
     routing::get,
 };
 
@@ -53,19 +54,22 @@ async fn put_blob(
 ) -> Result<StatusCode, ApiError> {
     blocking(local, move |local| {
         validate_id(&id)?;
-        decode_blob(&body, &id)?;
-        local.blobs.put(&id, &body)
+        let size = decode_blob(&body, &id)?.len();
+        local.put_blob(&id, &body, size, None)
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn has_blob(local: ApiState<Local>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+async fn has_blob(local: ApiState<Local>, Path(id): Path<String>) -> Result<Response, ApiError> {
     Ok(
-        if blocking(local, move |local| local.blobs.contains(&id)).await? {
-            StatusCode::NO_CONTENT
-        } else {
-            StatusCode::NOT_FOUND
+        match blocking(local, move |local| local.blob_size(&id)).await? {
+            Some(size) => (
+                StatusCode::NO_CONTENT,
+                [("x-scn-blob-size", size.to_string())],
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
         },
     )
 }

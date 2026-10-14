@@ -16,17 +16,22 @@ struct CountingBackend {
     local: Local,
     commits: AtomicUsize,
     parents: AtomicUsize,
+    blobs: AtomicUsize,
 }
 
 impl Backend for CountingBackend {
-    fn put_blob(&self, id: &str, bytes: &[u8], path: Option<&str>) -> Result<()> {
-        self.local.put_blob(id, bytes, path)
+    fn put_blob(&self, id: &str, bytes: &[u8], size: usize, path: Option<&str>) -> Result<()> {
+        self.local.put_blob(id, bytes, size, path)
     }
     fn blob(&self, id: &str) -> Result<Vec<u8>> {
+        self.blobs.fetch_add(1, Ordering::Relaxed);
         self.local.blob(id)
     }
     fn has_blob(&self, id: &str) -> Result<bool> {
         self.local.has_blob(id)
+    }
+    fn blob_size(&self, id: &str) -> Result<Option<usize>> {
+        self.local.blob_size(id)
     }
     fn get_commit(&self, id: &str) -> Result<Commit> {
         self.commits.fetch_add(1, Ordering::Relaxed);
@@ -70,6 +75,7 @@ fn tree_cache_avoids_history_replay_and_rebuilds_evicted_revisions() {
         .unwrap(),
         commits: AtomicUsize::new(0),
         parents: AtomicUsize::new(0),
+        blobs: AtomicUsize::new(0),
     });
     let store = Store::with_backend(backend.clone());
     let mut head = change(&store, &[], "root", &[("a", Some("initial"))]);
@@ -107,6 +113,65 @@ fn tree_cache_avoids_history_replay_and_rebuilds_evicted_revisions() {
     assert_eq!(backend.commits.load(Ordering::Relaxed), 0);
     let missing = "0".repeat(64);
     assert!(reader.is_ancestor(&missing, &missing).is_err());
+}
+
+#[test]
+fn large_file_validation_uses_durable_sizes_without_reading_blob_contents() {
+    use std::io::{self, Read};
+    let directory = tempfile::tempdir().unwrap();
+    let local = Local::open(
+        directory.path(),
+        Blobs::disk(&directory.path().join("blobs")).unwrap(),
+    )
+    .unwrap();
+    let writer = Store::with_backend(Arc::new(local));
+    let size = scn::store::MAX_BLOB as u64 + 17;
+    let entry = scn::content::read_entry(io::repeat(3).take(size), size, false, |id, bytes| {
+        assert_eq!(writer.put_blob(bytes).unwrap(), id);
+        Ok(())
+    })
+    .unwrap();
+    let backend = Arc::new(CountingBackend {
+        local: Local::open(
+            directory.path(),
+            Blobs::disk(&directory.path().join("blobs")).unwrap(),
+        )
+        .unwrap(),
+        commits: AtomicUsize::new(0),
+        parents: AtomicUsize::new(0),
+        blobs: AtomicUsize::new(0),
+    });
+    let store = Store::with_backend(backend.clone());
+    assert_eq!(
+        store
+            .prepare_file(FileRequest {
+                manifest: entry.manifest.clone().unwrap(),
+                executable: false
+            })
+            .unwrap(),
+        entry
+    );
+    store
+        .create_commit(CommitRequest {
+            parents: vec![],
+            author: "tester".into(),
+            message: "large file".into(),
+            changes: Changes::from([("large".into(), Some(entry.clone()))]),
+        })
+        .unwrap();
+    assert_eq!(backend.blobs.load(Ordering::Relaxed), 0);
+    let id = entry.blobs().next().unwrap();
+    let size = backend.local.blob_size(id).unwrap().unwrap();
+    assert_eq!(size, scn::content::CHUNK_SIZE);
+    std::fs::remove_file(directory.path().join("blobs").join(id)).unwrap();
+    assert!(
+        store
+            .prepare_file(FileRequest {
+                manifest: entry.manifest.unwrap(),
+                executable: false
+            })
+            .is_err()
+    );
 }
 
 fn change(

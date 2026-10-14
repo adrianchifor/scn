@@ -10,7 +10,7 @@ Its stateless controllers, SQLite shards, and S3 storage can potentially scale t
 
 - **Controllers** run commits, history queries, diff, blame, merge, and rebase. Multiple controllers share one repository without local durable state. Each keeps a bounded, disposable cache of reconstructed trees.
 - **Valkey** holds permanent shard assignments, `main`, and tags, plus compressed blobs with a configurable TTL. AOF and RDB persist the index; `volatile-lru` evicts only expiring cache entries.
-- **Shards** store immutable file deltas and commit headers in independent SQLite WAL databases. New paths go to the shard with the fewest assignments. Existing paths never move.
+- **Shards** store immutable file deltas, commit headers, and verified blob lengths in independent SQLite WAL databases. New paths go to the shard with the fewest assignments. Existing paths never move.
 - **Blob storage** is local disk per shard or a shared S3 bucket. Files over 32 MiB use 8 MiB chunks and a manifest. Chunks are addressed by SHA-256, deduplicated, and Zstandard compressed. New chunks can be distributed across shards.
 
 `commit` creates an immutable changeset on the server. `push` separately advances `main` with compare-and-swap. Agents can do both entirely through the API, without a checkout. See [AGENTS.md](AGENTS.md) for the client and API guide.

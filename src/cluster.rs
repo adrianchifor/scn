@@ -131,7 +131,7 @@ impl Cluster {
 }
 
 impl Backend for Cluster {
-    fn put_blob(&self, id: &str, bytes: &[u8], path: Option<&str>) -> Result<()> {
+    fn put_blob(&self, id: &str, bytes: &[u8], _: usize, path: Option<&str>) -> Result<()> {
         let preferred = path
             .map(|path| self.allocate("paths", path, None))
             .transpose()?;
@@ -169,15 +169,26 @@ impl Backend for Cluster {
     }
 
     fn has_blob(&self, id: &str) -> Result<bool> {
+        Ok(self.blob_size(id)?.is_some())
+    }
+
+    fn blob_size(&self, id: &str) -> Result<Option<usize>> {
         let Some(shard) = self.owner("blobs", id)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let response = self.send(self.http.head(format!("{shard}/internal/blobs/{id}")))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(false);
+            return Ok(None);
         }
-        Self::response(response)?;
-        Ok(true)
+        let response = Self::response(response)?;
+        let size: usize = response
+            .headers()
+            .get("x-scn-blob-size")
+            .context("missing blob size")?
+            .to_str()?
+            .parse()?;
+        ensure!(size <= crate::store::MAX_BLOB, "invalid blob size");
+        Ok(Some(size))
     }
 
     fn get_commit(&self, id: &str) -> Result<Commit> {

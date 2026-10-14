@@ -16,7 +16,10 @@ use scn::{
 use std::{
     collections::BTreeMap,
     io::{self, Read},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 type Objects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
@@ -53,10 +56,20 @@ async fn fetch(State(objects): State<Objects>, Path((_, key)): Path<(String, Str
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files() {
     let objects = Objects::default();
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let reads = downloads.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let router = Router::new()
         .route("/{bucket}/{*key}", get(fetch).put(put))
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                if request.method() == reqwest::Method::GET {
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+                async move { next.run(request).await }
+            },
+        ))
         .with_state(objects.clone());
     let mock = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -98,6 +111,16 @@ async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files(
         .put_file(io::repeat(9).take(size), size, false, Some("large"))
         .await
         .unwrap();
+    let _: FileEntry = client
+        .post(
+            "/v1/files",
+            &FileRequest {
+                manifest: large.manifest.clone().unwrap(),
+                executable: false,
+            },
+        )
+        .await
+        .unwrap();
     let commit: Commit = client
         .post(
             "/v1/commits",
@@ -120,6 +143,7 @@ async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files(
         )
         .await
         .unwrap();
+    assert_eq!(downloads.load(Ordering::Relaxed), 0);
     client.land(commit.id).await.unwrap();
     assert_eq!(client.blob(&id).await.unwrap(), b"S3 content\n");
     client.write_file(&large, &mut io::sink()).await.unwrap();
