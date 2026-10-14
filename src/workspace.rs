@@ -4,6 +4,7 @@ use crate::{
     store::{MAX_BLOB, decode_blob, encode_blob},
 };
 use anyhow::{Context, Result, bail, ensure};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -219,6 +220,9 @@ impl Workspace {
                 .iter()
                 .filter_map(|(path, entry)| entry.as_ref().map(|_| path)),
         ) {
+            if files.contains_key(path) {
+                continue;
+            }
             let full = self.path(path)?;
             match fs::metadata(&full) {
                 Ok(metadata) if metadata.is_file() => {
@@ -491,22 +495,45 @@ impl Workspace {
             Tree::new()
         };
         validate_tree(&tree)?;
-        for path in tree.keys() {
+        let changes = changes_between(&self.state.files, &tree);
+        for path in changes.keys().filter(|path| tree.contains_key(*path)) {
             self.check_target(path)?;
         }
         let stage = tempfile::tempdir_in(self.root.join(".scn"))?;
-        for (path, entry) in &tree {
-            let bytes = client.blob(&entry.blob).await?;
-            let staged = stage.path().join(path);
-            fs::create_dir_all(staged.parent().unwrap())?;
-            fs::write(&staged, bytes)?;
-            set_executable(&staged, entry.executable)?;
+        let mut downloads = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for (path, entry) in &changes {
+            if let Some(entry) = entry {
+                downloads
+                    .entry(&entry.blob)
+                    .or_default()
+                    .push((path, entry.executable));
+            }
         }
+        stream::iter(downloads)
+            .map(|(blob, paths)| {
+                let stage = stage.path();
+                async move {
+                    let bytes = client.blob(blob).await?;
+                    for (path, executable) in paths {
+                        let staged = stage.join(path);
+                        fs::create_dir_all(staged.parent().unwrap())?;
+                        fs::write(&staged, &bytes)?;
+                        set_executable(&staged, executable)?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+            })
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await?;
         self.ensure_clean()?;
-        for path in tree.keys() {
+        for path in changes.keys().filter(|path| tree.contains_key(*path)) {
             self.check_target(path)?;
         }
-        for path in self.state.files.keys() {
+        for path in changes
+            .keys()
+            .filter(|path| self.state.files.contains_key(*path))
+        {
             let full = self.path(path)?;
             fs::remove_file(&full)?;
             let mut parent = full.parent();
@@ -517,7 +544,7 @@ impl Workspace {
                 parent = directory.parent();
             }
         }
-        for path in tree.keys() {
+        for path in changes.keys().filter(|path| tree.contains_key(*path)) {
             let full = self.path(path)?;
             if full.is_dir() {
                 fs::remove_dir_all(&full)?;

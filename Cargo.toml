@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 redis = { version = "0.32", default-features = false, features = ["script"] }

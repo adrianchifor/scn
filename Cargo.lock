@@ -1471,6 +1471,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "ignore",
  "redis",
  "reqwest",

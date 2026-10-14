@@ -3,7 +3,19 @@ use std::{
     fs,
     path::Path,
     process::{Command, Output},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime},
 };
+
+#[derive(Default)]
+struct BlobMetrics {
+    requests: AtomicUsize,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
 
 struct Server {
     directory: tempfile::TempDir,
@@ -13,12 +25,36 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::with_blob_metrics(None).await
+    }
+
+    async fn with_blob_metrics(metrics: Option<Arc<BlobMetrics>>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(&directory.path().join("store")).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = server::router(store).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let metrics = metrics.clone();
+                async move {
+                    let Some(metrics) = metrics else {
+                        return next.run(request).await;
+                    };
+                    if !request.uri().path().starts_with("/v1/blobs/") {
+                        return next.run(request).await;
+                    }
+                    metrics.requests.fetch_add(1, Ordering::SeqCst);
+                    let active = metrics.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    metrics.peak.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let response = next.run(request).await;
+                    metrics.active.fetch_sub(1, Ordering::SeqCst);
+                    response
+                }
+            },
+        ));
         let task = tokio::spawn(async move {
-            axum::serve(listener, server::router(store)).await.unwrap();
+            axum::serve(listener, router).await.unwrap();
         });
         Self {
             directory,
@@ -26,6 +62,152 @@ impl Server {
             task,
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_downloads_unique_changed_blobs_with_bounded_concurrency() {
+    let metrics = Arc::new(BlobMetrics::default());
+    let server = Server::with_blob_metrics(Some(metrics.clone())).await;
+    let root = server.directory.path();
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let mut changes = Changes::new();
+    for n in 0..16 {
+        let blob = client
+            .put_blob(format!("file {n}").into_bytes())
+            .await
+            .unwrap();
+        changes.insert(
+            format!("file{n}"),
+            Some(FileEntry {
+                blob,
+                executable: false,
+            }),
+        );
+    }
+    let mut shared = changes["file0"].clone().unwrap();
+    shared.executable = true;
+    changes.insert("shared".into(), Some(shared));
+    let first: Commit = client
+        .post(
+            "/v1/commits",
+            &CommitRequest {
+                parents: vec![],
+                author: "a".into(),
+                message: "root".into(),
+                changes,
+            },
+        )
+        .await
+        .unwrap();
+    let mut work = Workspace::clone(&server.url, &root.join("work"), &first.id, vec![])
+        .await
+        .unwrap();
+    assert_eq!(metrics.requests.load(Ordering::SeqCst), 16);
+    assert!((2..=8).contains(&metrics.peak.load(Ordering::SeqCst)));
+    assert_eq!(fs::read(work.root.join("shared")).unwrap(), b"file 0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            fs::metadata(work.root.join("shared"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            fs::metadata(work.root.join("file0"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+    let preserved = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    fs::File::open(work.root.join("file0"))
+        .unwrap()
+        .set_modified(preserved)
+        .unwrap();
+    for entry in fs::read_dir(work.root.join(".scn/cache")).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    metrics.requests.store(0, Ordering::SeqCst);
+    let work_client = work.client().unwrap();
+    work.checkout(&work_client, &first.id, None).await.unwrap();
+    assert_eq!(metrics.requests.load(Ordering::SeqCst), 0);
+    let blob = client.put_blob(b"updated".to_vec()).await.unwrap();
+    let second: Commit = client
+        .post(
+            "/v1/commits",
+            &CommitRequest {
+                parents: vec![first.id],
+                author: "a".into(),
+                message: "update".into(),
+                changes: Changes::from([
+                    (
+                        "file1".into(),
+                        Some(FileEntry {
+                            blob: blob.clone(),
+                            executable: false,
+                        }),
+                    ),
+                    ("file2".into(), None),
+                ]),
+            },
+        )
+        .await
+        .unwrap();
+    work.checkout(&work_client, &second.id, None).await.unwrap();
+    assert_eq!(metrics.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::metadata(work.root.join("file0"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        preserved
+    );
+    assert_eq!(fs::read(work.root.join("file1")).unwrap(), b"updated");
+    assert!(!work.root.join("file2").exists());
+    fs::remove_file(work.root.join(".scn/cache").join(&blob)).unwrap();
+    fs::remove_file(root.join("store/blobs").join(&blob)).unwrap();
+    assert!(
+        work.checkout(&work_client, &second.parents[0], None)
+            .await
+            .is_ok()
+    );
+    assert!(work.checkout(&work_client, &second.id, None).await.is_err());
+    assert_eq!(
+        work.state.revision.as_deref(),
+        Some(second.parents[0].as_str())
+    );
+    assert_eq!(fs::read(work.root.join("file1")).unwrap(), b"file 1");
+    assert!(work.root.join("file2").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_cache_evicts_old_entries_after_crossing_its_size_limit() {
+    let server = Server::start().await;
+    let cache = server.directory.path().join("cache");
+    fs::create_dir(&cache).unwrap();
+    for n in 0..2 {
+        let file = fs::File::create(cache.join(format!("{n:064x}"))).unwrap();
+        file.set_len(33 * 1024 * 1024).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(n + 1))
+            .unwrap();
+    }
+    let client = Client::new(&server.url, &cache).unwrap();
+    let id = client.put_blob(b"contents".to_vec()).await.unwrap();
+    assert_eq!(client.blob(&id).await.unwrap(), b"contents");
+    let size: u64 = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(size <= 48 * 1024 * 1024);
+    assert!(!cache.join(format!("{:064x}", 0)).exists());
+    server.task.abort();
+    assert_eq!(client.blob(&id).await.unwrap(), b"contents");
 }
 
 impl Drop for Server {

@@ -6,7 +6,8 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, SystemTime},
 };
 
 const CACHE_LIMIT: u64 = 64 * 1024 * 1024;
@@ -15,6 +16,7 @@ pub struct Client {
     pub url: String,
     http: HttpClient,
     cache: PathBuf,
+    cache_size: Mutex<Option<u64>>,
 }
 
 impl Client {
@@ -34,6 +36,7 @@ impl Client {
                 .timeout(Duration::from_secs(120))
                 .build()?,
             cache: cache.to_owned(),
+            cache_size: Mutex::new(None),
         })
     }
 
@@ -128,10 +131,18 @@ impl Client {
         let path = self.cache.join(id);
         if let Ok(compressed) = fs::read(&path) {
             if let Ok(bytes) = decode_blob(&compressed, id) {
-                fs::File::open(&path)?.set_modified(std::time::SystemTime::now())?;
+                if let Ok(file) = fs::File::open(&path) {
+                    let _ = file.set_modified(std::time::SystemTime::now());
+                }
                 return Ok(bytes);
             }
-            fs::remove_file(&path)?;
+            let mut size = self.cache_size.lock().unwrap();
+            if let Ok(metadata) = fs::metadata(&path) {
+                fs::remove_file(&path)?;
+                if let Some(size) = size.as_mut() {
+                    *size = size.saturating_sub(metadata.len());
+                }
+            }
         }
         let response = self
             .http
@@ -142,32 +153,48 @@ impl Client {
         let bytes = decode_blob(&compressed, id)?;
         let mut temp = tempfile::NamedTempFile::new_in(&self.cache)?;
         temp.write_all(&compressed)?;
+        let mut size = self.cache_size.lock().unwrap();
+        if size.is_none() {
+            *size = Some(self.cache_entries()?.iter().map(|(_, size, _)| size).sum());
+        }
+        let size = size.as_mut().unwrap();
+        let previous = fs::metadata(&path).map_or(0, |metadata| metadata.len());
         temp.persist(&path)?;
-        self.trim_cache()?;
+        *size = size.saturating_sub(previous) + compressed.len() as u64;
+        if *size > CACHE_LIMIT {
+            *size = self.trim_cache()?;
+        }
         Ok(bytes)
     }
 
-    fn trim_cache(&self) -> Result<()> {
+    fn cache_entries(&self) -> Result<Vec<(SystemTime, u64, PathBuf)>> {
         let mut entries = Vec::new();
-        let mut size = 0;
         for entry in fs::read_dir(&self.cache)? {
             let entry = entry?;
+            if validate_id(&entry.file_name().to_string_lossy()).is_err() {
+                continue;
+            }
             let metadata = entry.metadata()?;
             if !metadata.is_file() {
                 continue;
             }
-            size += metadata.len();
             entries.push((metadata.modified()?, metadata.len(), entry.path()));
         }
+        Ok(entries)
+    }
+
+    fn trim_cache(&self) -> Result<u64> {
+        let mut entries = self.cache_entries()?;
+        let mut size: u64 = entries.iter().map(|(_, size, _)| size).sum();
         entries.sort();
         for (_, length, path) in entries {
-            if size <= CACHE_LIMIT {
+            if size <= CACHE_LIMIT * 3 / 4 {
                 break;
             }
             fs::remove_file(path)?;
             size -= length;
         }
-        Ok(())
+        Ok(size)
     }
 
     pub async fn land(&self, target: String) -> Result<()> {
