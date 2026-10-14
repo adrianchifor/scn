@@ -28,6 +28,10 @@ x-shard: &shard
     - http://s3:9000
     - --s3-prefix
     - local/blobs
+    - --max-requests
+    - "${SCN_MAX_REQUESTS:-128}"
+    - --transfer-memory
+    - "${SCN_TRANSFER_MEMORY:-256}"
   environment: *s3-environment
   depends_on:
     bucket-init:
@@ -46,6 +50,10 @@ x-controller: &controller
     - local
     - --blob-ttl
     - "3600"
+    - --max-requests
+    - "${SCN_MAX_REQUESTS:-128}"
+    - --transfer-memory
+    - "${SCN_TRANSFER_MEMORY:-256}"
     - --shard
     - http://shard-a:7878
     - --shard

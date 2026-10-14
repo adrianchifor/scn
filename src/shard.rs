@@ -1,6 +1,6 @@
 use crate::{
     model::*,
-    server::{ApiError, ApiState, blocking, limit_requests},
+    server::{ApiError, ApiState, RequestLimits, blocking, limit_requests},
     storage::{Backend, Local},
     store::{MAX_BLOB, verify_blob},
 };
@@ -14,6 +14,10 @@ use axum::{
 };
 
 pub fn router(local: Local) -> Router {
+    router_with_limits(local, RequestLimits::default())
+}
+
+pub fn router_with_limits(local: Local, limits: RequestLimits) -> Router {
     limit_requests(
         Router::new()
             .route("/health", get(|| async { "ok" }))
@@ -25,6 +29,7 @@ pub fn router(local: Local) -> Router {
             .route("/internal/changes/{id}", get(changes).put(put_changes))
             .layer(DefaultBodyLimit::max(MAX_BLOB + 128 * 1024))
             .with_state(local),
+        limits,
     )
 }
 

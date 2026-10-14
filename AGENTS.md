@@ -142,7 +142,7 @@ To download, fetch `manifest.chunks` in order, decompress and verify hashes and 
 
 Each request remains limited to 32 MiB (HTTP 413). Chunked files use binary diff and have no line blame.
 
-Servers admit eight concurrent API requests each. HTTP 503 means retry with backoff and honor `Retry-After`; CLI and controller requests retry automatically.
+HTTP 503 means retry with backoff and honor `Retry-After`; CLI and controller requests retry automatically.
 
 ## Concurrent changes and errors
 

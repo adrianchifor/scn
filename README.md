@@ -35,6 +35,8 @@ curl --fail http://127.0.0.1:7878/health
 
 Local S3 credentials default to `SCNLOCAL` / `scn-local-secret-change-me`. Override them with `SCN_S3_ACCESS_KEY` and `SCN_S3_SECRET_KEY` before starting the stack. `SCN_CACHE_MEMORY` sets Valkey's memory limit, default `256mb`. Only the gateway and S3 ports are published, bound to loopback.
 
+`SCN_MAX_REQUESTS` and `SCN_TRANSFER_MEMORY` tune each controller and shard's request capacity and transfer budget in MiB, defaulting to `128` and `256`.
+
 Each shard has its own volume. Valkey and S3 also have persistent volumes. Inspect or stop the stack with:
 
 ```sh
@@ -139,6 +141,10 @@ scn shard controller --listen 127.0.0.1:7881 --cache redis://127.0.0.1:6379/ --n
 Clients can use either controller, or a load balancer in front of them. Register another running shard by passing its URL with `--shard` when starting any controller. All controllers then allocate new paths to it without rebalancing. Shard URLs must remain stable; shard removal is not supported.
 
 For a single process without Valkey, use `scn serve --store /tmp/scn-store`.
+
+Small requests and transfers have separate pools of 128 slots. Transfers also share a 256 MiB payload budget: uploads reserve their announced size, while downloads and unknown-length bodies reserve 33 MiB. Requests wait up to one second in bounded queues before HTTP 503.
+
+Tune each server with `--max-requests 256 --transfer-memory 1024`. The budget covers payloads; allow memory for compression, trees, and other buffers. Adding controllers and shards adds independent capacity.
 
 ## Use an existing S3 bucket
 

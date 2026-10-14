@@ -7,14 +7,14 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, FromRequestParts, Path, Query, Request},
-    http::{StatusCode, header, request::Parts},
+    http::{Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) struct ApiError(pub StatusCode, pub String);
@@ -38,7 +38,7 @@ impl IntoResponse for ApiError {
 
 pub(crate) struct ApiState<T> {
     value: T,
-    permit: Arc<OwnedSemaphorePermit>,
+    permit: Arc<RequestPermit>,
 }
 
 impl<T: Clone + Send + Sync> FromRequestParts<T> for ApiState<T> {
@@ -47,7 +47,7 @@ impl<T: Clone + Send + Sync> FromRequestParts<T> for ApiState<T> {
     async fn from_request_parts(parts: &mut Parts, state: &T) -> Result<Self, ApiError> {
         let permit = parts
             .extensions
-            .get::<Arc<OwnedSemaphorePermit>>()
+            .get::<Arc<RequestPermit>>()
             .cloned()
             .ok_or_else(|| {
                 ApiError(
@@ -62,19 +62,122 @@ impl<T: Clone + Send + Sync> FromRequestParts<T> for ApiState<T> {
     }
 }
 
-pub(crate) fn limit_requests(router: Router) -> Router {
-    with_request_limit(router, Arc::new(Semaphore::new(8)))
+#[derive(Clone, Copy, clap::Args)]
+pub struct RequestLimits {
+    #[arg(long, default_value_t = 128, help = "Concurrent requests per pool, with separate pools for small requests and transfers", value_parser = clap::value_parser!(u32).range(1..=4096))]
+    max_requests: u32,
+    #[arg(long, default_value_t = 256, value_name = "MIB", help = "Payload budget for blob transfers and large request bodies", value_parser = clap::value_parser!(u32).range(33..=1048576))]
+    transfer_memory: u32,
 }
 
-fn with_request_limit(router: Router, permits: Arc<Semaphore>) -> Router {
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self {
+            max_requests: 128,
+            transfer_memory: 256,
+        }
+    }
+}
+
+struct RequestPermit {
+    _slot: OwnedSemaphorePermit,
+    _memory: Option<OwnedSemaphorePermit>,
+    _queue: OwnedSemaphorePermit,
+}
+
+struct RequestPool {
+    slots: Arc<Semaphore>,
+    queue: Arc<Semaphore>,
+}
+
+impl RequestPool {
+    fn new(capacity: u32) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(capacity as usize)),
+            queue: Arc::new(Semaphore::new(capacity as usize * 2)),
+        }
+    }
+
+    async fn acquire(&self, memory: Option<(&Arc<Semaphore>, u32)>) -> Option<Arc<RequestPermit>> {
+        let queue = self.queue.clone().try_acquire_owned().ok()?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let slot = self.slots.clone().acquire_owned().await.ok()?;
+            let memory = match memory {
+                Some((budget, weight)) => {
+                    Some(budget.clone().acquire_many_owned(weight).await.ok()?)
+                }
+                None => None,
+            };
+            Some(Arc::new(RequestPermit {
+                _slot: slot,
+                _memory: memory,
+                _queue: queue,
+            }))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+struct Admission {
+    small: RequestPool,
+    transfers: RequestPool,
+    memory: Arc<Semaphore>,
+}
+
+impl Admission {
+    fn new(limits: RequestLimits) -> Self {
+        Self {
+            small: RequestPool::new(limits.max_requests),
+            transfers: RequestPool::new(limits.max_requests),
+            memory: Arc::new(Semaphore::new(limits.transfer_memory as usize)),
+        }
+    }
+
+    fn weight(request: &Request) -> Option<u32> {
+        let path = request.uri().path();
+        let download = request.method() == Method::GET
+            && (path.starts_with("/v1/blobs/") || path.starts_with("/internal/blobs/"));
+        let length = request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+        let unknown_body = length.is_none()
+            && matches!(
+                *request.method(),
+                Method::POST | Method::PUT | Method::PATCH
+            );
+        if download || unknown_body {
+            Some(33)
+        } else if length.is_some_and(|size| size > 256 * 1024) {
+            Some(length.unwrap().div_ceil(1024 * 1024).clamp(1, 33) as u32)
+        } else {
+            None
+        }
+    }
+
+    async fn acquire(&self, weight: Option<u32>) -> Option<Arc<RequestPermit>> {
+        match weight {
+            Some(weight) => self.transfers.acquire(Some((&self.memory, weight))).await,
+            None => self.small.acquire(None).await,
+        }
+    }
+}
+
+pub(crate) fn limit_requests(router: Router, limits: RequestLimits) -> Router {
+    with_request_limit(router, Arc::new(Admission::new(limits)))
+}
+
+fn with_request_limit(router: Router, admission: Arc<Admission>) -> Router {
     router.layer(middleware::from_fn(
         move |mut request: Request, next: Next| {
-            let permits = permits.clone();
+            let admission = admission.clone();
             async move {
                 if request.uri().path() == "/health" {
                     return next.run(request).await;
                 }
-                let Ok(permit) = permits.try_acquire_owned() else {
+                let Some(permit) = admission.acquire(Admission::weight(&request)).await else {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         [(header::RETRY_AFTER, "1")],
@@ -82,7 +185,6 @@ fn with_request_limit(router: Router, permits: Arc<Semaphore>) -> Router {
                     )
                         .into_response();
                 };
-                let permit = Arc::new(permit);
                 request.extensions_mut().insert(permit.clone());
                 let (parts, body) = next.run(request).await.into_parts();
                 let stream = body.into_data_stream().map(move |chunk| {
@@ -109,6 +211,10 @@ pub(crate) async fn blocking<T: Send + 'static, S: Send + 'static>(
 }
 
 pub fn router(store: Store) -> Router {
+    router_with_limits(store, RequestLimits::default())
+}
+
+pub fn router_with_limits(store: Store, limits: RequestLimits) -> Router {
     limit_requests(
         Router::new()
             .route("/health", get(|| async { "ok" }))
@@ -131,6 +237,7 @@ pub fn router(store: Store) -> Router {
             .route("/v1/rebase", post(rebase))
             .layer(DefaultBodyLimit::max(MAX_BLOB))
             .with_state(store),
+        limits,
     )
 }
 
@@ -384,7 +491,7 @@ mod tests {
         io::Write,
         sync::{
             Condvar, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -408,13 +515,16 @@ mod tests {
 
     #[tokio::test]
     async fn requests_are_limited_before_reading_bodies_and_health_remains_available() {
-        let permits = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(Admission::new(RequestLimits {
+            max_requests: 1,
+            transfer_memory: 33,
+        }));
         let router = with_request_limit(
             Router::new()
                 .route("/upload", post(|_: Bytes| async { "ok" }))
                 .route("/health", get(|| async { "ok" }))
                 .layer(DefaultBodyLimit::max(MAX_BLOB)),
-            permits.clone(),
+            admission.clone(),
         );
         let (url, task) = start(router).await;
         let mut stalled = std::net::TcpStream::connect(url.trim_start_matches("http://")).unwrap();
@@ -423,9 +533,14 @@ mod tests {
                 b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 33554432\r\n\r\n",
             )
             .unwrap();
-        wait_until(|| permits.available_permits() == 0).await;
+        wait_until(|| admission.transfers.slots.available_permits() == 0).await;
         let http = reqwest::Client::new();
-        let response = http.post(format!("{url}/upload")).send().await.unwrap();
+        let response = http
+            .post(format!("{url}/upload"))
+            .body(vec![0; 1024 * 1024])
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
         assert_eq!(
@@ -437,7 +552,7 @@ mod tests {
             StatusCode::OK
         );
         drop(stalled);
-        wait_until(|| permits.available_permits() == 1).await;
+        wait_until(|| admission.transfers.slots.available_permits() == 1).await;
         assert_eq!(
             http.post(format!("{url}/upload"))
                 .send()
@@ -453,7 +568,7 @@ mod tests {
 
     #[derive(Default)]
     struct Gate {
-        started: AtomicBool,
+        started: AtomicUsize,
         released: Mutex<bool>,
         wake: Condvar,
     }
@@ -469,7 +584,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_requests_keep_their_permit_until_blocking_work_finishes() {
-        let permits = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(Admission::new(RequestLimits {
+            max_requests: 1,
+            transfer_memory: 33,
+        }));
         let gate = Arc::new(Gate::default());
         let release = Release(gate.clone());
         let router = with_request_limit(
@@ -478,7 +596,7 @@ mod tests {
                     "/work",
                     post(|state: ApiState<Arc<Gate>>| async {
                         blocking(state, |gate| {
-                            gate.started.store(true, Ordering::SeqCst);
+                            gate.started.fetch_add(1, Ordering::SeqCst);
                             let mut released = gate.released.lock().unwrap();
                             while !*released {
                                 released = gate.wake.wait(released).unwrap();
@@ -489,7 +607,7 @@ mod tests {
                     }),
                 )
                 .with_state(gate.clone()),
-            permits.clone(),
+            admission.clone(),
         );
         let (url, task) = start(router).await;
         let mut cancelled =
@@ -497,16 +615,104 @@ mod tests {
         cancelled
             .write_all(b"POST /work HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
             .unwrap();
-        wait_until(|| gate.started.load(Ordering::SeqCst)).await;
+        wait_until(|| gate.started.load(Ordering::SeqCst) == 1).await;
         drop(cancelled);
-        let response = reqwest::Client::new()
-            .post(format!("{url}/work"))
+        let pending = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{url}/work"))
+                .header(header::CONTENT_LENGTH, "0")
+                .send()
+                .await
+                .unwrap()
+        });
+        wait_until(|| admission.small.queue.available_permits() == 0).await;
+        assert_eq!(gate.started.load(Ordering::SeqCst), 1);
+        assert!(!pending.is_finished());
+        drop(release);
+        assert_eq!(pending.await.unwrap().status(), StatusCode::NO_CONTENT);
+        wait_until(|| admission.small.slots.available_permits() == 1).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn saturated_transfer_memory_leaves_small_uploads_and_commits_available() {
+        let admission = Arc::new(Admission::new(RequestLimits {
+            max_requests: 128,
+            transfer_memory: 64,
+        }));
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let router = with_request_limit(
+            Router::new()
+                .route("/v1/blobs", post(put_blob))
+                .route("/v1/commits", post(create_commit))
+                .layer(DefaultBodyLimit::max(MAX_BLOB))
+                .with_state(store),
+            admission.clone(),
+        );
+        let (url, task) = start(router).await;
+        let mut uploads = Vec::new();
+        for _ in 0..8 {
+            let mut upload =
+                std::net::TcpStream::connect(url.trim_start_matches("http://")).unwrap();
+            upload.write_all(b"POST /v1/blobs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8388608\r\n\r\n").unwrap();
+            uploads.push(upload);
+        }
+        wait_until(|| admission.memory.available_permits() == 0).await;
+        let http = reqwest::Client::new();
+        let writes = (0..16).map(|index| {
+            let http = &http;
+            let url = &url;
+            async move {
+                let blob: RefValue = http
+                    .post(format!("{url}/v1/blobs"))
+                    .body(format!("small file {index}"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let commit: Commit = http
+                    .post(format!("{url}/v1/commits"))
+                    .json(&CommitRequest {
+                        parents: vec![],
+                        author: "tester".into(),
+                        message: "small commit".into(),
+                        changes: Changes::from([(
+                            format!("small-{index}"),
+                            Some(FileEntry {
+                                blob: blob.target.unwrap(),
+                                executable: false,
+                                manifest: None,
+                            }),
+                        )]),
+                    })
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                assert_eq!(commit.changes.len(), 1);
+                Ok::<_, anyhow::Error>(())
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            futures_util::future::try_join_all(writes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(admission.memory.available_permits(), 0);
+        let response = http
+            .post(format!("{url}/v1/blobs"))
+            .body(vec![0; 1024 * 1024])
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        drop(release);
-        wait_until(|| permits.available_permits() == 1).await;
+        drop(uploads);
+        wait_until(|| admission.memory.available_permits() == 64).await;
         task.abort();
     }
 

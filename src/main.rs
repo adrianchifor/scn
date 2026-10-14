@@ -52,6 +52,8 @@ struct ShardArgs {
     listen: String,
     #[command(flatten)]
     blobs: BlobArgs,
+    #[command(flatten)]
+    limits: server::RequestLimits,
 }
 
 #[derive(Subcommand)]
@@ -68,6 +70,8 @@ enum ShardCommand {
         blob_ttl: u64,
         #[arg(long, default_value = "127.0.0.1:7878")]
         listen: String,
+        #[command(flatten)]
+        limits: server::RequestLimits,
     },
 }
 
@@ -136,6 +140,8 @@ enum Command {
         listen: String,
         #[command(flatten)]
         blobs: BlobArgs,
+        #[command(flatten)]
+        limits: server::RequestLimits,
     },
     #[command(about = "Create a working copy without downloading history")]
     Clone {
@@ -355,19 +361,28 @@ async fn main() -> Result<()> {
                 shard,
                 blob_ttl,
                 listen,
+                limits,
             }) => {
                 let backend = tokio::task::spawn_blocking(move || {
                     scn::cluster::Cluster::open(&cache, &namespace, &shard, blob_ttl)
                 })
                 .await??;
-                return server::serve(Store::with_backend(Arc::new(backend)), &listen).await;
+                return server::serve_router(
+                    server::router_with_limits(Store::with_backend(Arc::new(backend)), limits),
+                    &listen,
+                )
+                .await;
             }
             None => {
                 let local = tokio::task::spawn_blocking(move || {
                     scn::storage::Local::open(&args.store, args.blobs.storage(&args.store)?)
                 })
                 .await??;
-                return server::serve_router(scn::shard::router(local), &args.listen).await;
+                return server::serve_router(
+                    scn::shard::router_with_limits(local, args.limits),
+                    &args.listen,
+                )
+                .await;
             }
         },
         Command::ImportGit {
@@ -385,12 +400,13 @@ async fn main() -> Result<()> {
             store,
             listen,
             blobs,
+            limits,
         } => {
             let store = tokio::task::spawn_blocking(move || {
                 Store::with_blobs(&store, blobs.storage(&store)?)
             })
             .await??;
-            return server::serve(store, &listen).await;
+            return server::serve_router(server::router_with_limits(store, limits), &listen).await;
         }
         Command::Clone {
             url,
