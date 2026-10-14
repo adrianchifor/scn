@@ -74,7 +74,7 @@
   <text x="924" y="245" class="small">AOF + RDB · volatile-lru</text>
   <rect x="920" y="266" width="320" height="66" rx="10" fill="white" stroke="#efdab2"/>
   <text x="936" y="290" style="font-size:14px; font-weight:650">Permanent index · no TTL</text>
-  <text x="936" y="314" class="small">Path / object owners · main ref</text>
+  <text x="936" y="314" class="small">Path / object owners · main · tags</text>
   <rect x="920" y="344" width="320" height="66" rx="10" fill="white" stroke="#efdab2"/>
   <text x="936" y="368" style="font-size:14px; font-weight:650">Compressed blob cache · TTL</text>
   <text x="936" y="392" class="small">Evictable without losing routing state</text>

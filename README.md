@@ -7,7 +7,7 @@ A centralized source control system in Rust, inspired by [Scion](https://www.ant
 ![scn architecture: CLI users and AI agents connect to stateless controllers, backed by a persistent Valkey index, independent SQLite shards, and S3 blob storage](docs/architecture.svg)
 
 - **Controllers** run commits, history queries, diff, blame, merge, and rebase. Multiple controllers share one repository without local durable state. Each keeps a bounded, disposable cache of reconstructed trees.
-- **Valkey** holds permanent shard assignments and `main`, plus compressed blobs with a configurable TTL. AOF and RDB persist the index; `volatile-lru` evicts only expiring cache entries.
+- **Valkey** holds permanent shard assignments, `main`, and tags, plus compressed blobs with a configurable TTL. AOF and RDB persist the index; `volatile-lru` evicts only expiring cache entries.
 - **Shards** store immutable file deltas and commit headers in independent SQLite WAL databases. New paths go to the shard with the fewest assignments. Existing paths never move.
 - **Blob storage** is local disk per shard or a shared S3 bucket. IDs are SHA-256 hashes of raw contents. Stored and downloaded blobs use Zstandard only.
 
@@ -97,7 +97,26 @@ scn checkout main --sparse docs
 scn checkout main --full
 ```
 
-Commits preserve omitted files. Revisions accept `HEAD`, `main`, `origin/main`, or a full scn ID. `checkout` has a `switch` alias; `push` has a `land` alias. There is no Git wire protocol or offline commit support.
+Commits preserve omitted files. Revisions accept `HEAD`, `main`, `origin/main`, tag names, or a full scn ID. `checkout` has a `switch` alias; `push` has a `land` alias. There is no Git wire protocol or offline commit support.
+
+## Tags
+
+```sh
+scn tag v1.0.0
+scn tag -a releases/v1.1.0 HEAD -m "Release 1.1.0"
+scn tag
+scn tag -l 'releases/*'
+scn show v1.0.0 hello.txt
+scn checkout releases/v1.1.0
+scn tag -f v1.0.0 HEAD
+scn tag -d v1.0.0 releases/v1.1.0
+```
+
+Tags point to commits. `tag NAME [REV]` creates a lightweight tag at `REV`, defaulting to `HEAD`. `-a -m MESSAGE` creates an annotated tag with a tagger and server timestamp; `-m` also implies annotation. Set `SCN_AUTHOR` or `tag --author` for the tagger. Existing names require `-f` to replace.
+
+Tag creation, replacement, and deletion take effect on the server immediately. Every client sees the same tags; `push` still only advances `main`. Creating a tag leaves `main` and working files unchanged. Use `refs/tags/NAME` when a tag name collides with `main`, `HEAD`, `origin/main`, or a commit ID. Names follow Git ref naming rules and can contain `/` and Unicode. Signing and signature verification are unsupported.
+
+The API provides `GET /v1/tags`, `GET /v1/tags/NAME`, `POST /v1/tags`, and `DELETE /v1/tags/NAME`. For example, POST `{"name":"v1.0.0","target":"COMMIT_ID"}` to create a lightweight tag. See [AGENTS.md](AGENTS.md) for annotations, replacement, errors, and URL encoding.
 
 ## Run a cluster without Docker
 
@@ -140,7 +159,9 @@ With an empty `main`:
 scn import-git /path/to/git-repo http://127.0.0.1:7878 --rev main
 ```
 
-Imports reachable commits, authors and timestamps, messages, empty commits, and merge parents. Original Git IDs are retained; `main` advances only after success. Bare repositories work and uncommitted files are untouched. Branch and tag refs are not copied.
+Imports the selected revision's history and every commit referenced by a Git tag, including histories outside the selected branch. Lightweight and annotated tags retain their names and targets. Annotations retain tagger identity, timestamp, message, and original Git tag object ID. Nested tags resolve to the final commit while retaining the outer annotation. Signature text is retained in imported messages without verification.
+
+The selected revision becomes `main` after commits and tags import successfully. Bare repositories work, original Git commit IDs are retained, and uncommitted files are untouched. Branch refs are not copied. Failed imports can leave draft commits and tags; identical imported tags are safe to retry, and conflicting existing tags are rejected. Tags pointing to trees or blobs are unsupported and rejected before importing commits.
 
 Files are limited to 32 MiB. Paths and commit metadata must be UTF-8. Symlinks, submodules, shallow imports, and merges with more than two parents are unsupported.
 
