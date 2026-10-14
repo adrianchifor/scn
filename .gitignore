@@ -1,3 +1,5 @@
 /target
 /.scn
 /.scn-store
+/.scn-shard
+/.scn-cache

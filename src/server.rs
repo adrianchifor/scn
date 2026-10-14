@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub StatusCode, pub String);
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
@@ -58,9 +58,13 @@ pub fn router(store: Store) -> Router {
 }
 
 pub async fn serve(store: Store, address: &str) -> Result<()> {
+    serve_router(router(store), address).await
+}
+
+pub async fn serve_router(router: Router, address: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!("scn listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, router(store))
+    axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -84,9 +88,18 @@ async fn update_main(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn put_blob(State(store): State<Store>, body: Bytes) -> Result<Json<RefValue>, ApiError> {
+#[derive(Deserialize)]
+struct BlobQuery {
+    path: Option<String>,
+}
+
+async fn put_blob(
+    State(store): State<Store>,
+    Query(query): Query<BlobQuery>,
+    body: Bytes,
+) -> Result<Json<RefValue>, ApiError> {
     Ok(Json(RefValue {
-        target: Some(blocking(store, move |s| s.put_blob(&body)).await?),
+        target: Some(blocking(store, move |s| s.put_blob_at(&body, query.path.as_deref())).await?),
     }))
 }
 
@@ -97,7 +110,7 @@ async fn get_blob(
     let bytes = blocking(store, move |s| s.compressed_blob(&id)).await?;
     Ok((
         [
-            (header::CONTENT_TYPE, "application/zlib"),
+            (header::CONTENT_TYPE, "application/zstd"),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         bytes,

@@ -41,6 +41,12 @@ pub struct ImportCommitRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct StoredCommit {
+    pub commit: Commit,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RefValue {
     pub target: Option<String>,
 }

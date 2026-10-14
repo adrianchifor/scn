@@ -1,65 +1,59 @@
 use crate::model::*;
+use crate::storage::{Backend, Blobs, Local};
 use anyhow::{Context, Result, bail, ensure};
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use flate2::read::ZlibDecoder;
 use similar::{ChangeTag, TextDiff};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    io::Read,
+    path::Path,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const MAX_BLOB: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Store {
-    root: PathBuf,
+    backend: Arc<dyn Backend>,
 }
 
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        fs::create_dir_all(root.join("blobs"))?;
-        let store = Self {
-            root: root.to_owned(),
-        };
-        store.connection()?.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS commits (
-                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                 id TEXT NOT NULL UNIQUE,
-                 data TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS refs (name TEXT PRIMARY KEY, target TEXT NOT NULL);",
-        )?;
-        Ok(store)
+        Self::with_blobs(root, Blobs::disk(&root.join("blobs"))?)
     }
 
-    fn connection(&self) -> Result<Connection> {
-        let connection = Connection::open(self.root.join("scn.db"))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        Ok(connection)
+    pub fn with_blobs(root: &Path, blobs: Blobs) -> Result<Self> {
+        Ok(Self::with_backend(Arc::new(Local::open(root, blobs)?)))
+    }
+
+    pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
+        Self { backend }
     }
 
     pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
+        self.put_blob_at(bytes, None)
+    }
+
+    pub fn put_blob_at(&self, bytes: &[u8], path: Option<&str>) -> Result<String> {
         ensure!(bytes.len() <= MAX_BLOB, "blob exceeds 32 MiB limit");
-        let id = hash(bytes);
-        let path = self.root.join("blobs").join(&id);
-        if !path.exists() {
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(bytes)?;
-            let mut temp = tempfile::NamedTempFile::new_in(self.root.join("blobs"))?;
-            temp.write_all(&encoder.finish()?)?;
-            temp.as_file().sync_all()?;
-            temp.persist(&path)?;
+        if let Some(path) = path {
+            validate_path(path)?;
         }
+        let id = hash(bytes);
+        self.backend.put_blob(&id, &encode_blob(bytes)?, path)?;
         Ok(id)
     }
 
     pub fn compressed_blob(&self, id: &str) -> Result<Vec<u8>> {
         validate_id(id)?;
-        fs::read(self.root.join("blobs").join(id)).context("blob not found")
+        let bytes = self.backend.blob(id)?;
+        if is_zstd(&bytes) {
+            return Ok(bytes);
+        }
+        let compressed = encode_blob(&decode_blob(&bytes, id)?)?;
+        self.backend.put_blob(id, &compressed, None)?;
+        Ok(compressed)
     }
 
     pub fn blob(&self, id: &str) -> Result<Vec<u8>> {
@@ -68,22 +62,11 @@ impl Store {
 
     pub fn get_commit(&self, id: &str) -> Result<Commit> {
         validate_id(id)?;
-        let data: String = self
-            .connection()?
-            .query_row("SELECT data FROM commits WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .context("changeset not found")?;
-        Ok(serde_json::from_str(&data)?)
+        self.backend.get_commit(id)
     }
 
     pub fn main_ref(&self) -> Result<Option<String>> {
-        Ok(self
-            .connection()?
-            .query_row("SELECT target FROM refs WHERE name = 'main'", [], |row| {
-                row.get(0)
-            })
-            .optional()?)
+        self.backend.main_ref()
     }
 
     pub fn resolve(&self, revision: &str) -> Result<String> {
@@ -165,7 +148,7 @@ impl Store {
             if let Some(entry) = entry {
                 validate_id(&entry.blob)?;
                 ensure!(
-                    self.root.join("blobs").join(&entry.blob).is_file(),
+                    self.backend.has_blob(&entry.blob)?,
                     "missing blob: {}",
                     entry.blob
                 );
@@ -194,10 +177,7 @@ impl Store {
             changes,
         };
         commit.id = hash(&serde_json::to_vec(&commit)?);
-        self.connection()?.execute(
-            "INSERT OR IGNORE INTO commits (id, data) VALUES (?1, ?2)",
-            params![commit.id, serde_json::to_string(&commit)?],
-        )?;
+        self.backend.save_commit(&commit)?;
         Ok(commit)
     }
 
@@ -209,24 +189,7 @@ impl Store {
                 "main updates must be fast-forward; merge or rebase first"
             );
         }
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let actual: Option<String> = transaction
-            .query_row("SELECT target FROM refs WHERE name = 'main'", [], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        ensure!(
-            actual == update.expected,
-            "main moved; merge or rebase onto main and retry"
-        );
-        transaction.execute(
-            "INSERT INTO refs (name, target) VALUES ('main', ?1)
-             ON CONFLICT(name) DO UPDATE SET target = excluded.target",
-            [&update.target],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        self.backend.update_main(update)
     }
 
     fn ancestors(&self, head: &str) -> Result<BTreeMap<String, usize>> {
@@ -415,11 +378,25 @@ impl Store {
     }
 }
 
+pub fn is_zstd(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+}
+
+pub fn encode_blob(bytes: &[u8]) -> Result<Vec<u8>> {
+    Ok(zstd::stream::encode_all(bytes, 3)?)
+}
+
 pub fn decode_blob(compressed: &[u8], id: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    ZlibDecoder::new(compressed)
-        .take((MAX_BLOB + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    if is_zstd(compressed) {
+        zstd::stream::read::Decoder::new(compressed)?
+            .take((MAX_BLOB + 1) as u64)
+            .read_to_end(&mut bytes)?;
+    } else {
+        ZlibDecoder::new(compressed)
+            .take((MAX_BLOB + 1) as u64)
+            .read_to_end(&mut bytes)?;
+    }
     ensure!(
         bytes.len() <= MAX_BLOB && hash(&bytes) == id,
         "blob integrity check failed: {id}"

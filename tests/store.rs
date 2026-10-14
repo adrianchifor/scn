@@ -264,3 +264,23 @@ fn invalid_objects_and_file_directory_collisions_are_rejected() {
         .unwrap();
     assert!(store.tree(&replacement.id).unwrap().contains_key("a/b"));
 }
+
+#[test]
+fn blobs_use_zstandard_and_legacy_zlib_is_upgraded_on_read() {
+    use std::io::Write;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let id = store.put_blob(b"content\n").unwrap();
+    assert!(scn::store::is_zstd(&store.compressed_blob(&id).unwrap()));
+    let mut old = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    old.write_all(b"content\n").unwrap();
+    std::fs::write(
+        directory.path().join("blobs").join(&id),
+        old.finish().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(store.blob(&id).unwrap(), b"content\n");
+    assert!(scn::store::is_zstd(
+        &std::fs::read(directory.path().join("blobs").join(&id)).unwrap()
+    ));
+}

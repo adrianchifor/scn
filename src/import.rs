@@ -183,7 +183,7 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
                         Some(blob) => blob.clone(),
                         None => {
                             let bytes = objects.read(git_blob, "blob")?;
-                            let blob = client.put_blob(bytes).await?;
+                            let blob = client.put_blob_at(bytes, Some(path)).await?;
                             blobs.insert(git_blob.to_owned(), blob.clone());
                             blob
                         }

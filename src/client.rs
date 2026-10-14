@@ -1,4 +1,7 @@
-use crate::{model::*, store::decode_blob};
+use crate::{
+    model::*,
+    store::{decode_blob, encode_blob, is_zstd},
+};
 use anyhow::{Context, Result, ensure};
 use reqwest::{Client as HttpClient, Response};
 use serde::{Serialize, de::DeserializeOwned};
@@ -103,13 +106,16 @@ impl Client {
     }
 
     pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
+        self.put_blob_at(bytes, None).await
+    }
+
+    pub async fn put_blob_at(&self, bytes: Vec<u8>, path: Option<&str>) -> Result<String> {
         let expected = hash(&bytes);
-        let response = self
-            .http
-            .post(format!("{}/v1/blobs", self.url))
-            .body(bytes)
-            .send()
-            .await?;
+        let mut request = self.http.post(format!("{}/v1/blobs", self.url));
+        if let Some(path) = path {
+            request = request.query(&[("path", path)]);
+        }
+        let response = request.body(bytes).send().await?;
         let id = Self::response(response)
             .await?
             .json::<RefValue>()
@@ -125,6 +131,9 @@ impl Client {
         let path = self.cache.join(id);
         if let Ok(compressed) = fs::read(&path) {
             if let Ok(bytes) = decode_blob(&compressed, id) {
+                if !is_zstd(&compressed) {
+                    fs::write(&path, encode_blob(&bytes)?)?;
+                }
                 fs::File::open(&path)?.set_modified(std::time::SystemTime::now())?;
                 return Ok(bytes);
             }

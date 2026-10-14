@@ -1,6 +1,10 @@
+pub mod cache;
 pub mod client;
+pub mod cluster;
 pub mod import;
 pub mod model;
 pub mod server;
+pub mod shard;
+pub mod storage;
 pub mod store;
 pub mod workspace;

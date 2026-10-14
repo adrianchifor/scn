@@ -1,4 +1,8 @@
-use crate::{client::Client, model::*, store::MAX_BLOB};
+use crate::{
+    client::Client,
+    model::*,
+    store::{MAX_BLOB, decode_blob, encode_blob},
+};
 use anyhow::{Context, Result, bail, ensure};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -14,6 +18,10 @@ pub struct WorkspaceState {
     pub revision: Option<String>,
     pub sparse: Vec<String>,
     pub files: Tree,
+    #[serde(default)]
+    pub index: Changes,
+    #[serde(default)]
+    pub remote_main: Option<String>,
 }
 
 pub struct Workspace {
@@ -76,6 +84,8 @@ impl Workspace {
                 revision: None,
                 sparse: vec![],
                 files: Tree::new(),
+                index: Changes::new(),
+                remote_main: None,
             },
         };
         let _lock = workspace.lock()?;
@@ -86,6 +96,7 @@ impl Workspace {
         } else {
             Some(client.commit(revision).await?.id)
         };
+        workspace.state.remote_main = client.main_ref().await?;
         workspace.materialize(&client, target, sparse).await?;
         Ok(workspace)
     }
@@ -113,6 +124,13 @@ impl Workspace {
     }
 
     pub fn revision(&self, revision: &str) -> Result<String> {
+        if revision == "origin/main" {
+            return self
+                .state
+                .remote_main
+                .clone()
+                .context("origin/main is empty; run scn fetch");
+        }
         if revision == "HEAD" {
             self.state
                 .revision
@@ -149,7 +167,8 @@ impl Workspace {
         builder
             .hidden(false)
             .ignore(false)
-            .git_ignore(false)
+            .git_ignore(true)
+            .require_git(false)
             .git_global(false)
             .git_exclude(false)
             .parents(false)
@@ -194,7 +213,12 @@ impl Workspace {
             );
             files.insert(path.to_owned(), self.read_entry(path)?);
         }
-        for path in self.state.files.keys() {
+        for path in self.state.files.keys().chain(
+            self.state
+                .index
+                .iter()
+                .filter_map(|(path, entry)| entry.as_ref().map(|_| path)),
+        ) {
             let full = self.path(path)?;
             match fs::metadata(&full) {
                 Ok(metadata) if metadata.is_file() => {
@@ -229,7 +253,8 @@ impl Workspace {
 
     pub fn ensure_clean(&self) -> Result<()> {
         ensure!(
-            changes_between(&self.state.files, &self.scan()?).is_empty(),
+            self.state.index.is_empty()
+                && changes_between(&self.state.files, &self.scan()?).is_empty(),
             "working copy has changes; commit or move them before checkout, merge, or rebase"
         );
         Ok(())
@@ -241,17 +266,131 @@ impl Workspace {
         message: String,
         author: String,
     ) -> Result<Commit> {
+        self.stage(&[".".into()], &self.root.clone(), false)?;
+        self.commit_staged(client, message, author).await
+    }
+
+    pub fn staged_tree(&self) -> Tree {
+        let mut tree = self.state.files.clone();
+        apply(&mut tree, &self.state.index);
+        tree
+    }
+
+    pub fn stage(&mut self, paths: &[String], cwd: &Path, tracked_only: bool) -> Result<()> {
         let files = self.scan()?;
-        let changes = changes_between(&self.state.files, &files);
-        ensure!(!changes.is_empty(), "nothing to commit");
+        let directory = self.root.join(".scn/staged");
+        fs::create_dir_all(&directory)?;
+        let mut index = self.state.index.clone();
+        for input in paths {
+            let mut absolute = PathBuf::new();
+            for component in cwd.join(input).components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        absolute.pop();
+                    }
+                    component => absolute.push(component.as_os_str()),
+                }
+            }
+            let prefix = absolute
+                .strip_prefix(&self.root)
+                .context("path is outside the working copy")?
+                .to_str()
+                .context("non-UTF-8 path")?;
+            if !prefix.is_empty() {
+                validate_path(prefix)?;
+            }
+            let candidates: std::collections::BTreeSet<_> = self
+                .state
+                .files
+                .keys()
+                .chain(files.keys())
+                .chain(index.keys())
+                .cloned()
+                .collect();
+            let mut matched = false;
+            for path in candidates {
+                if !prefix.is_empty() && !selected(&path, &[prefix.to_owned()]) {
+                    continue;
+                }
+                if tracked_only
+                    && !self.state.files.contains_key(&path)
+                    && !self.state.index.contains_key(&path)
+                {
+                    continue;
+                }
+                matched = true;
+                if files.get(&path) == self.state.files.get(&path) {
+                    index.remove(&path);
+                    continue;
+                }
+                let entry = files.get(&path).cloned();
+                if let Some(entry) = &entry {
+                    let bytes = fs::read(self.path(&path)?)?;
+                    ensure!(
+                        hash(&bytes) == entry.blob,
+                        "file changed while staging; retry: {path}"
+                    );
+                    let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
+                    temp.write_all(&encode_blob(&bytes)?)?;
+                    temp.persist(directory.join(&entry.blob))?;
+                }
+                index.insert(path, entry);
+            }
+            ensure!(
+                matched || prefix.is_empty(),
+                "path matched no files: {input}"
+            );
+        }
+        let mut tree = self.state.files.clone();
+        apply(&mut tree, &index);
+        validate_tree(&tree)?;
+        self.state.index = index;
+        self.save()?;
+        self.prune_staged()?;
+        Ok(())
+    }
+
+    fn prune_staged(&self) -> Result<()> {
+        let directory = self.root.join(".scn/staged");
+        if !directory.exists() {
+            return Ok(());
+        }
+        let keep: std::collections::BTreeSet<_> = self
+            .state
+            .index
+            .values()
+            .flatten()
+            .map(|entry| entry.blob.as_str())
+            .collect();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if !keep.contains(entry.file_name().to_string_lossy().as_ref()) {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn staged_blob(&self, id: &str) -> Result<Vec<u8>> {
+        validate_id(id)?;
+        decode_blob(&fs::read(self.root.join(".scn/staged").join(id))?, id)
+    }
+
+    pub async fn commit_staged(
+        &mut self,
+        client: &Client,
+        message: String,
+        author: String,
+    ) -> Result<Commit> {
+        let files = self.staged_tree();
+        let changes = self.state.index.clone();
+        ensure!(!changes.is_empty(), "nothing to commit; use scn add first");
         for (path, entry) in &changes {
             if let Some(entry) = entry {
-                let bytes = fs::read(self.path(path)?)?;
-                ensure!(
-                    hash(&bytes) == entry.blob,
-                    "file changed during commit; retry: {path}"
-                );
-                client.put_blob(bytes).await?;
+                client
+                    .put_blob_at(self.staged_blob(&entry.blob)?, Some(path))
+                    .await?;
             }
         }
         let commit: Commit = client
@@ -267,7 +406,9 @@ impl Workspace {
             .await?;
         self.state.revision = Some(commit.id.clone());
         self.state.files = files;
+        self.state.index.clear();
         self.save()?;
+        self.prune_staged()?;
         Ok(commit)
     }
 
@@ -285,6 +426,53 @@ impl Workspace {
             sparse.unwrap_or_else(|| self.state.sparse.clone()),
         )
         .await
+    }
+
+    pub async fn fetch(&mut self, client: &Client) -> Result<Option<String>> {
+        let target = client.main_ref().await?;
+        self.state.remote_main = target.clone();
+        self.save()?;
+        Ok(target)
+    }
+
+    pub async fn pull(
+        &mut self,
+        client: &Client,
+        rebase: bool,
+        ff_only: bool,
+        author: String,
+    ) -> Result<()> {
+        self.ensure_clean()?;
+        let Some(target) = self.fetch(client).await? else {
+            return Ok(());
+        };
+        let Some(head) = self.state.revision.clone() else {
+            return self
+                .materialize(client, Some(target), self.state.sparse.clone())
+                .await;
+        };
+        if ff_only {
+            let base: RefValue = client
+                .get(&format!("/v1/merge-base/{head}/{target}"), &[])
+                .await?;
+            ensure!(
+                base.target.as_deref() == Some(&head) || base.target.as_deref() == Some(&target),
+                "pull would diverge; use --rebase or merge"
+            );
+        }
+        let route = if rebase { "/v1/rebase" } else { "/v1/merge" };
+        let commit: Commit = client
+            .post(
+                route,
+                &IntegrateRequest {
+                    head,
+                    onto: target,
+                    author,
+                },
+            )
+            .await?;
+        self.materialize(client, Some(commit.id), self.state.sparse.clone())
+            .await
     }
 
     pub async fn materialize(

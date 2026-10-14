@@ -283,8 +283,9 @@ async fn cli_workflow_including_history_binary_files_and_checkout_protection() {
     fs::write(work.join("binary"), [0, 255, 1]).unwrap();
     fs::write(work.join(".scnignore"), "ignored\n").unwrap();
     fs::write(work.join("ignored"), "keep me").unwrap();
-    assert!(scn(&work, &["status"]).contains("A hello"));
-    assert!(!scn(&work, &["status"]).contains("A ignored"));
+    assert!(scn(&work, &["status"]).contains("?? hello"));
+    assert!(!scn(&work, &["status"]).contains("?? ignored"));
+    scn(&work, &["add", "."]);
     let first = scn(&work, &["commit", "-m", "initial"])
         .split_whitespace()
         .next()
@@ -303,6 +304,7 @@ async fn cli_workflow_including_history_binary_files_and_checkout_protection() {
         fs::read_to_string(work.join("hello")).unwrap(),
         "first\nchanged\n"
     );
+    scn(&work, &["add", "."]);
     let second = scn(&work, &["commit", "-m", "second"])
         .split_whitespace()
         .next()
@@ -487,4 +489,76 @@ async fn client_recovers_from_corrupt_cached_blobs() {
     fs::write(cache.join(&id), "corrupt").unwrap();
     assert_eq!(client.blob(&id).await.unwrap(), b"content");
     assert_eq!(client.blob(&id).await.unwrap(), b"content");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_style_staging_push_fetch_and_pull_preserve_local_and_remote_changes() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    scn(root, &["clone", &server.url, "first"]);
+    scn(root, &["clone", &server.url, "second"]);
+    let first = root.join("first");
+    let second = root.join("second");
+    fs::write(first.join("a"), "staged\n").unwrap();
+    assert!(!run(&first, &["commit", "-m", "unstaged"]).status.success());
+    scn(&first, &["add", "a"]);
+    fs::write(first.join("a"), "later\n").unwrap();
+    assert!(scn(&first, &["status"]).contains("AM a"));
+    assert!(scn(&first, &["diff", "--cached"]).contains("+staged"));
+    assert!(scn(&first, &["diff"]).contains("+later"));
+    scn(&first, &["commit", "-m", "initial"]);
+    assert_eq!(scn(&first, &["show", "HEAD", "a"]), "staged\n");
+    assert_eq!(fs::read_to_string(first.join("a")).unwrap(), "later\n");
+    scn(&first, &["push", "origin", "main"]);
+    scn(&second, &["fetch"]);
+    assert!(!second.join("a").exists());
+    assert_eq!(scn(&second, &["show", "origin/main", "a"]), "staged\n");
+    scn(&second, &["pull", "--ff-only"]);
+    assert_eq!(fs::read_to_string(second.join("a")).unwrap(), "staged\n");
+    fs::write(first.join("a"), "staged\n").unwrap();
+    fs::write(first.join("local"), "local\n").unwrap();
+    scn(&first, &["add", "local"]);
+    scn(&first, &["commit", "-m", "local"]);
+    fs::write(second.join("a"), "remote\n").unwrap();
+    fs::write(second.join("untracked"), "stay untracked").unwrap();
+    scn(&second, &["commit", "-am", "remote"]);
+    assert!(scn(&second, &["status"]).contains("?? untracked"));
+    scn(&second, &["push"]);
+    assert!(!run(&first, &["push"]).status.success());
+    assert!(!run(&first, &["pull", "--ff-only"]).status.success());
+    assert_eq!(fs::read_to_string(first.join("local")).unwrap(), "local\n");
+    scn(&first, &["pull", "--rebase"]);
+    assert_eq!(fs::read_to_string(first.join("a")).unwrap(), "remote\n");
+    assert_eq!(fs::read_to_string(first.join("local")).unwrap(), "local\n");
+    scn(&first, &["push"]);
+    assert!(scn(&first, &["status"]).contains("clean"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staging_respects_gitignore_subdirectories_and_deletions() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    scn(root, &["clone", &server.url, "work"]);
+    let work = root.join("work");
+    fs::write(work.join(".gitignore"), "ignored\n").unwrap();
+    fs::write(work.join("ignored"), "ignored").unwrap();
+    fs::create_dir(work.join("src")).unwrap();
+    fs::write(work.join("src/file"), "first").unwrap();
+    scn(&work, &["add", "-A"]);
+    scn(&work, &["commit", "-m", "initial"]);
+    assert!(scn(&work, &["status"]).contains("clean"));
+    fs::write(work.join("pending"), "staged").unwrap();
+    scn(&work, &["add", "pending"]);
+    fs::write(work.join("pending"), "updated after staging").unwrap();
+    fs::write(work.join(".gitignore"), "ignored\npending\n").unwrap();
+    scn(&work, &["commit", "-am", "update staged file"]);
+    assert_eq!(
+        scn(&work, &["show", "HEAD", "pending"]),
+        "updated after staging"
+    );
+    fs::remove_file(work.join("src/file")).unwrap();
+    scn(&work.join("src"), &["add", "."]);
+    assert!(scn(&work, &["status"]).contains("D  src/file"));
+    scn(&work, &["commit", "-m", "delete"]);
+    assert!(scn(&work, &["status"]).contains("clean"));
 }

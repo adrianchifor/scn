@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use scn::{
     model::*,
     server,
@@ -9,7 +9,9 @@ use scn::{
 use std::{
     fs,
     io::{self, Write},
+    net::SocketAddr,
     path::PathBuf,
+    sync::Arc,
 };
 
 #[derive(Parser)]
@@ -19,8 +21,78 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Args)]
+struct BlobArgs {
+    #[arg(long)]
+    s3_bucket: Option<String>,
+    #[arg(long, default_value = "us-east-1")]
+    s3_region: String,
+    #[arg(long, requires = "s3_bucket")]
+    s3_endpoint: Option<String>,
+    #[arg(long, default_value = "scn/blobs")]
+    s3_prefix: String,
+}
+
+impl BlobArgs {
+    fn storage(&self, root: &std::path::Path) -> Result<scn::storage::Blobs> {
+        match &self.s3_bucket {
+            Some(bucket) => scn::storage::Blobs::s3(
+                bucket,
+                &self.s3_region,
+                self.s3_endpoint.as_deref(),
+                &self.s3_prefix,
+            ),
+            None => scn::storage::Blobs::disk(&root.join("blobs")),
+        }
+    }
+}
+
+#[derive(Args)]
+struct ShardArgs {
+    #[command(subcommand)]
+    command: Option<ShardCommand>,
+    #[arg(long, default_value = ".scn-shard")]
+    store: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:7879")]
+    listen: String,
+    #[command(flatten)]
+    blobs: BlobArgs,
+}
+
+#[derive(Subcommand)]
+enum ShardCommand {
+    #[command(about = "Run a stateless API controller backed by Valkey and SQLite shards")]
+    Controller {
+        #[arg(long, default_value = "redis://127.0.0.1:6379/")]
+        cache: String,
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        #[arg(long)]
+        shard: Vec<String>,
+        #[arg(long, default_value_t = 3600)]
+        blob_ttl: u64,
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        listen: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Run a SQLite storage shard or shard controller")]
+    Shard(ShardArgs),
+    #[command(about = "Run Valkey with AOF, RDB, and volatile-lru eviction")]
+    Cache {
+        #[arg(long, default_value = ".scn-cache")]
+        dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:6379")]
+        listen: SocketAddr,
+        #[arg(long, default_value = "1gb")]
+        maxmemory: String,
+        #[arg(long, default_value = "always", value_parser = ["always", "everysec"])]
+        appendfsync: String,
+        #[arg(long, default_value = "valkey-server")]
+        binary: String,
+    },
     #[command(about = "Import a Git revision and its history into an empty scn server")]
     ImportGit {
         repository: PathBuf,
@@ -34,6 +106,8 @@ enum Command {
         store: PathBuf,
         #[arg(long, default_value = "127.0.0.1:7878")]
         listen: String,
+        #[command(flatten)]
+        blobs: BlobArgs,
     },
     #[command(about = "Create a working copy without downloading history")]
     Clone {
@@ -46,14 +120,26 @@ enum Command {
     },
     #[command(about = "Show added, modified, and deleted files")]
     Status,
+    #[command(about = "Stage file contents and deletions for the next commit")]
+    Add {
+        #[arg(required_unless_present = "all")]
+        paths: Vec<String>,
+        #[arg(short = 'A', long)]
+        all: bool,
+    },
     #[command(about = "Create a server-side changeset from all local changes")]
     Commit {
         #[arg(short, long)]
         message: String,
         #[arg(long)]
         author: Option<String>,
+        #[arg(short = 'a', long)]
+        all: bool,
     },
-    #[command(about = "Check out a revision, keeping the current sparse selection")]
+    #[command(
+        about = "Check out a revision, keeping the current sparse selection",
+        visible_alias = "switch"
+    )]
     Checkout {
         revision: String,
         #[arg(long, value_name = "PATH", conflicts_with = "full")]
@@ -67,6 +153,8 @@ enum Command {
         from: Option<String>,
         #[arg(requires = "from")]
         to: Option<String>,
+        #[arg(long, alias = "staged", conflicts_with = "from")]
+        cached: bool,
     },
     #[command(about = "Show first-parent changeset history")]
     Log {
@@ -103,7 +191,27 @@ enum Command {
         author: Option<String>,
     },
     #[command(about = "Fast-forward main to the current changeset using compare-and-swap")]
-    Land,
+    #[command(name = "push", visible_alias = "land")]
+    Push {
+        #[arg(default_value = "origin", value_parser = ["origin"])]
+        remote: String,
+        #[arg(default_value = "main", value_parser = ["main"])]
+        branch: String,
+    },
+    #[command(about = "Update origin/main without changing working files")]
+    Fetch {
+        #[arg(default_value = "origin", value_parser = ["origin"])]
+        remote: String,
+    },
+    #[command(about = "Fetch main and integrate it into the current changeset")]
+    Pull {
+        #[arg(default_value = "origin", value_parser = ["origin"])]
+        remote: String,
+        #[arg(long, conflicts_with = "ff_only")]
+        rebase: bool,
+        #[arg(long)]
+        ff_only: bool,
+    },
 }
 
 fn author(value: Option<String>) -> String {
@@ -144,6 +252,40 @@ fn mode(entry: Option<&FileEntry>) -> &str {
 async fn main() -> Result<()> {
     let command = Cli::parse().command;
     match command {
+        Command::Cache {
+            dir,
+            listen,
+            maxmemory,
+            appendfsync,
+            binary,
+        } => {
+            return tokio::task::spawn_blocking(move || {
+                scn::cache::serve(&binary, &dir, listen, &maxmemory, &appendfsync)
+            })
+            .await?;
+        }
+        Command::Shard(args) => match args.command {
+            Some(ShardCommand::Controller {
+                cache,
+                namespace,
+                shard,
+                blob_ttl,
+                listen,
+            }) => {
+                let backend = tokio::task::spawn_blocking(move || {
+                    scn::cluster::Cluster::open(&cache, &namespace, &shard, blob_ttl)
+                })
+                .await??;
+                return server::serve(Store::with_backend(Arc::new(backend)), &listen).await;
+            }
+            None => {
+                let local = tokio::task::spawn_blocking(move || {
+                    scn::storage::Local::open(&args.store, args.blobs.storage(&args.store)?)
+                })
+                .await??;
+                return server::serve_router(scn::shard::router(local), &args.listen).await;
+            }
+        },
         Command::ImportGit {
             repository,
             url,
@@ -155,8 +297,16 @@ async fn main() -> Result<()> {
             println!("main -> {}", commit.id);
             return Ok(());
         }
-        Command::Serve { store, listen } => {
-            return server::serve(Store::open(&store)?, &listen).await;
+        Command::Serve {
+            store,
+            listen,
+            blobs,
+        } => {
+            let store = tokio::task::spawn_blocking(move || {
+                Store::with_blobs(&store, blobs.storage(&store)?)
+            })
+            .await??;
+            return server::serve(store, &listen).await;
         }
         Command::Clone {
             url,
@@ -177,26 +327,52 @@ async fn main() -> Result<()> {
     match command {
         Command::Status => {
             let files = workspace.scan()?;
-            let changes = changes_between(&workspace.state.files, &files);
-            for (path, entry) in &changes {
-                let status = if entry.is_none() {
-                    'D'
-                } else if workspace.state.files.contains_key(path) {
-                    'M'
-                } else {
-                    'A'
+            let index = workspace.staged_tree();
+            let staged = changes_between(&workspace.state.files, &index);
+            let unstaged = changes_between(&index, &files);
+            let paths: std::collections::BTreeSet<_> =
+                staged.keys().chain(unstaged.keys()).collect();
+            for path in &paths {
+                if !workspace.state.files.contains_key(*path) && !index.contains_key(*path) {
+                    println!("?? {path}");
+                    continue;
+                }
+                let status = |changes: &Changes, before: &Tree| match changes.get(*path) {
+                    None => ' ',
+                    Some(None) => 'D',
+                    Some(Some(_)) if !before.contains_key(*path) => 'A',
+                    Some(_) => 'M',
                 };
-                println!("{status} {path}");
+                println!(
+                    "{}{} {path}",
+                    status(&staged, &workspace.state.files),
+                    status(&unstaged, &index)
+                );
             }
-            if changes.is_empty() {
+            if paths.is_empty() {
                 println!("Working copy clean");
             }
+        }
+        Command::Add { paths, all } => {
+            let cwd = if all {
+                workspace.root.clone()
+            } else {
+                std::env::current_dir()?
+            };
+            let paths = if all { vec![".".into()] } else { paths };
+            workspace.stage(&paths, &cwd, false)?;
         }
         Command::Commit {
             message,
             author: name,
+            all,
         } => {
-            let commit = workspace.commit(&client, message, author(name)).await?;
+            if all {
+                workspace.stage(&[".".into()], &workspace.root.clone(), true)?;
+            }
+            let commit = workspace
+                .commit_staged(&client, message, author(name))
+                .await?;
             println!("{} {}", commit.id, commit.message);
         }
         Command::Checkout {
@@ -214,7 +390,7 @@ async fn main() -> Result<()> {
             workspace.checkout(&client, &revision, sparse).await?;
             println!("Checked out {}", workspace.state.revision.unwrap());
         }
-        Command::Diff { from, to } => {
+        Command::Diff { from, to, cached } => {
             if let (Some(from), Some(to)) = (from, to) {
                 let from = workspace.revision(&from)?;
                 let to = workspace.revision(&to)?;
@@ -229,16 +405,43 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
-                let files = workspace.scan()?;
-                for (path, entry) in changes_between(&workspace.state.files, &files) {
-                    let before = workspace.state.files.get(&path);
+                let index = workspace.staged_tree();
+                let mut files = if cached {
+                    index.clone()
+                } else {
+                    workspace.scan()?
+                };
+                if !cached {
+                    files.retain(|path, _| index.contains_key(path));
+                }
+                let base = if cached {
+                    &workspace.state.files
+                } else {
+                    &index
+                };
+                for (path, entry) in changes_between(base, &files) {
+                    let before = base.get(&path);
                     let old = if let Some(before) = before {
-                        client.blob(&before.blob).await?
+                        if !cached
+                            && workspace
+                                .state
+                                .index
+                                .get(&path)
+                                .is_some_and(Option::is_some)
+                        {
+                            workspace.staged_blob(&before.blob)?
+                        } else {
+                            client.blob(&before.blob).await?
+                        }
                     } else {
                         vec![]
                     };
-                    let new = if entry.is_some() {
-                        fs::read(workspace.path(&path)?)?
+                    let new = if let Some(entry) = &entry {
+                        if cached {
+                            workspace.staged_blob(&entry.blob)?
+                        } else {
+                            fs::read(workspace.path(&path)?)?
+                        }
                     } else {
                         vec![]
                     };
@@ -336,10 +539,26 @@ async fn main() -> Result<()> {
                 .await?;
             println!("{} {}", commit.id, commit.message);
         }
-        Command::Land => {
-            workspace.ensure_clean()?;
+        Command::Fetch { .. } => {
+            let target = workspace.fetch(&client).await?;
+            println!("origin/main -> {}", target.as_deref().unwrap_or("empty"));
+        }
+        Command::Pull {
+            rebase, ff_only, ..
+        } => {
+            workspace
+                .pull(&client, rebase, ff_only, author(None))
+                .await?;
+            println!(
+                "HEAD -> {}",
+                workspace.state.revision.as_deref().unwrap_or("empty")
+            );
+        }
+        Command::Push { .. } => {
             let head = workspace.revision("HEAD")?;
             client.land(head.clone()).await?;
+            workspace.state.remote_main = Some(head.clone());
+            workspace.save()?;
             println!("main -> {head}");
         }
         _ => bail!("unexpected command"),
