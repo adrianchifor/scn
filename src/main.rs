@@ -21,6 +21,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Import a Git revision and its history into an empty scn server")]
+    ImportGit {
+        repository: PathBuf,
+        url: String,
+        #[arg(long, default_value = "HEAD")]
+        rev: String,
+    },
     #[command(about = "Run a source control server")]
     Serve {
         #[arg(long, default_value = ".scn-store")]
@@ -137,6 +144,17 @@ fn mode(entry: Option<&FileEntry>) -> &str {
 async fn main() -> Result<()> {
     let command = Cli::parse().command;
     match command {
+        Command::ImportGit {
+            repository,
+            url,
+            rev,
+        } => {
+            let cache = tempfile::tempdir()?;
+            let client = scn::client::Client::new(&url, cache.path())?;
+            let commit = scn::import::import_git(&client, &repository, &rev).await?;
+            println!("main -> {}", commit.id);
+            return Ok(());
+        }
         Command::Serve { store, listen } => {
             return server::serve(Store::open(&store)?, &listen).await;
         }

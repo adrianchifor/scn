@@ -15,6 +15,8 @@ pub struct FileEntry {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Commit {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_id: Option<String>,
     pub parents: Vec<String>,
     pub author: String,
     pub message: String,
@@ -28,6 +30,14 @@ pub struct CommitRequest {
     pub author: String,
     pub message: String,
     pub changes: Changes,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ImportCommitRequest {
+    #[serde(flatten)]
+    pub commit: CommitRequest,
+    pub timestamp: u64,
+    pub git_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

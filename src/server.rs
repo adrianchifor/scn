@@ -44,6 +44,7 @@ pub fn router(store: Store) -> Router {
         .route("/v1/blobs", post(put_blob))
         .route("/v1/blobs/{id}", get(get_blob))
         .route("/v1/commits", post(create_commit))
+        .route("/v1/import/commits", post(import_commit))
         .route("/v1/commits/{revision}", get(get_commit))
         .route("/v1/tree/{revision}", get(tree))
         .route("/v1/log/{revision}", get(log))
@@ -109,6 +110,13 @@ async fn create_commit(
     Json(request): Json<CommitRequest>,
 ) -> Result<Json<Commit>, ApiError> {
     Ok(Json(blocking(store, |s| s.create_commit(request)).await?))
+}
+
+async fn import_commit(
+    State(store): State<Store>,
+    Json(request): Json<ImportCommitRequest>,
+) -> Result<Json<Commit>, ApiError> {
+    Ok(Json(blocking(store, |s| s.import_commit(request)).await?))
 }
 
 async fn get_commit(

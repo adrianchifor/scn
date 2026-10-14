@@ -111,6 +111,32 @@ impl Store {
     }
 
     pub fn create_commit(&self, request: CommitRequest) -> Result<Commit> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos()
+            .try_into()?;
+        self.write_commit(request, timestamp, None)
+    }
+
+    pub fn import_commit(&self, request: ImportCommitRequest) -> Result<Commit> {
+        ensure!(
+            matches!(request.git_id.len(), 40 | 64)
+                && request
+                    .git_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "invalid Git commit id"
+        );
+        self.write_commit(request.commit, request.timestamp, Some(request.git_id))
+    }
+
+    fn write_commit(
+        &self,
+        request: CommitRequest,
+        timestamp: u64,
+        git_id: Option<String>,
+    ) -> Result<Commit> {
+        let imported = git_id.is_some();
         ensure!(
             request.parents.len() <= 2,
             "at most two parents are supported"
@@ -120,7 +146,7 @@ impl Store {
             "duplicate parents"
         );
         ensure!(
-            !request.message.trim().is_empty(),
+            imported || !request.message.trim().is_empty(),
             "message must not be empty"
         );
         ensure!(
@@ -155,23 +181,21 @@ impl Store {
         validate_tree(&tree)?;
         let changes = changes_between(&before, &tree);
         ensure!(
-            !changes.is_empty() || request.parents.len() == 2,
+            imported || !changes.is_empty() || request.parents.len() == 2,
             "nothing to commit"
         );
         let mut commit = Commit {
             id: String::new(),
+            git_id,
             parents: request.parents,
             author: request.author,
             message: request.message,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_nanos()
-                .try_into()?,
+            timestamp,
             changes,
         };
         commit.id = hash(&serde_json::to_vec(&commit)?);
         self.connection()?.execute(
-            "INSERT INTO commits (id, data) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO commits (id, data) VALUES (?1, ?2)",
             params![commit.id, serde_json::to_string(&commit)?],
         )?;
         Ok(commit)

@@ -169,6 +169,10 @@ impl Client {
 
     pub async fn land(&self, target: String) -> Result<()> {
         let expected = self.main_ref().await?;
+        self.update_main(expected, target).await
+    }
+
+    pub async fn update_main(&self, expected: Option<String>, target: String) -> Result<()> {
         let response = self
             .http
             .post(format!("{}/v1/refs/main", self.url))

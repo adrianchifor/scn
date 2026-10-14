@@ -53,6 +53,225 @@ fn scn(root: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn git(root: &Path, args: &[&str]) -> Vec<u8> {
+    git_env(root, args, &[])
+}
+
+fn git_env(root: &Path, args: &[&str], environment: &[(&str, &str)]) -> Vec<u8> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Original Author")
+        .env("GIT_AUTHOR_EMAIL", "author@example.com")
+        .env("GIT_COMMITTER_NAME", "Original Committer")
+        .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+        .env("GIT_AUTHOR_DATE", "1234567890 +0530")
+        .env("GIT_COMMITTER_DATE", "1234567900 +0530")
+        .envs(environment.iter().copied())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_import_preserves_history_merges_metadata_and_committed_contents() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    let source = root.join("git");
+    fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    git(
+        &source,
+        &["commit", "--allow-empty", "--allow-empty-message", "-m", ""],
+    );
+    fs::write(source.join("a"), "initial\n").unwrap();
+    fs::write(source.join("binary\tfile"), [0, 255, 1]).unwrap();
+    fs::write(source.join("empty"), "").unwrap();
+    fs::create_dir(source.join("dir")).unwrap();
+    fs::write(source.join("dir/file"), "nested").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "Add files\n\nOriginal body"]);
+    git(&source, &["branch", "side"]);
+    fs::write(source.join("a"), "main\n").unwrap();
+    fs::remove_file(source.join("dir/file")).unwrap();
+    fs::remove_dir(source.join("dir")).unwrap();
+    fs::write(source.join("dir"), "now a file").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "Main changes"]);
+    git(&source, &["checkout", "side"]);
+    fs::write(source.join("binary\tfile"), [0, 2, 254]).unwrap();
+    git(&source, &["mv", "empty", "renamed"]);
+    fs::write(source.join("script"), "run\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["update-index", "--chmod=+x", "script"]);
+    git(&source, &["commit", "-m", "Side changes"]);
+    git(&source, &["checkout", "--", "script"]);
+    git(&source, &["checkout", "main"]);
+    git(&source, &["merge", "--no-ff", "side", "-m", "Merge side"]);
+    git(&source, &["tag", "import-this"]);
+    fs::write(source.join("later"), "not in selected revision").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "Later change"]);
+    fs::write(source.join("a"), "uncommitted").unwrap();
+    fs::write(source.join("untracked"), "untracked").unwrap();
+    let status = git(&source, &["status", "--porcelain", "-z"]);
+    let output = scn(
+        root,
+        &[
+            "import-git",
+            source.to_str().unwrap(),
+            &server.url,
+            "--rev",
+            "import-this",
+        ],
+    );
+    assert_eq!(git(&source, &["status", "--porcelain", "-z"]), status);
+    let mapping: std::collections::HashMap<_, _> = output
+        .lines()
+        .filter_map(|line| line.split_once(" -> "))
+        .filter(|(left, _)| *left != "main")
+        .collect();
+    assert_eq!(mapping.len(), 5);
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    for (original_id, imported_id) in &mapping {
+        let original =
+            String::from_utf8(git(&source, &["cat-file", "commit", original_id])).unwrap();
+        let (headers, message) = original.split_once("\n\n").unwrap();
+        let imported = client.commit(imported_id).await.unwrap();
+        assert_eq!(imported.git_id.as_deref(), Some(*original_id));
+        assert_eq!(imported.message, message);
+        assert_eq!(imported.author, "Original Author <author@example.com>");
+        assert_eq!(imported.timestamp, 1_234_567_890_000_000_000);
+        let parents: Vec<_> = headers
+            .lines()
+            .filter_map(|line| line.strip_prefix("parent "))
+            .map(|id| mapping[id].to_owned())
+            .collect();
+        assert_eq!(imported.parents, parents);
+        let tree = client.tree(imported_id, &[]).await.unwrap();
+        let files = git(&source, &["ls-tree", "-r", "-z", original_id]);
+        let mut count = 0;
+        for record in files.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let record = std::str::from_utf8(record).unwrap();
+            let (metadata, path) = record.split_once('\t').unwrap();
+            let fields: Vec<_> = metadata.split_whitespace().collect();
+            assert_eq!(
+                client.blob(&tree[path].blob).await.unwrap(),
+                git(&source, &["cat-file", "blob", fields[2]])
+            );
+            assert_eq!(tree[path].executable, fields[0] == "100755");
+            count += 1;
+        }
+        assert_eq!(tree.len(), count);
+    }
+    let main = client.commit("main").await.unwrap();
+    assert_eq!(main.parents.len(), 2);
+    scn(root, &["clone", &server.url, "imported"]);
+    assert_eq!(
+        fs::read_to_string(root.join("imported/a")).unwrap(),
+        "main\n"
+    );
+    assert!(!root.join("imported/later").exists());
+    assert!(!root.join("imported/untracked").exists());
+    let retry = run(root, &["import-git", source.to_str().unwrap(), &server.url]);
+    assert!(!retry.status.success());
+    assert!(String::from_utf8_lossy(&retry.stderr).contains("empty main ref"));
+    assert_eq!(client.main_ref().await.unwrap(), Some(main.id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_import_supports_bare_repositories_and_empty_histories() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    git(
+        &source,
+        &["commit", "--allow-empty", "--allow-empty-message", "-m", ""],
+    );
+    git(root, &["clone", "--bare", "source", "bare"]);
+    scn(root, &["import-git", "bare", &server.url]);
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let main = client.commit("main").await.unwrap();
+    assert!(main.parents.is_empty());
+    assert!(main.message.is_empty());
+    assert!(client.tree(&main.id, &[]).await.unwrap().is_empty());
+    scn(root, &["clone", &server.url, "work"]);
+    assert!(scn(&root.join("work"), &["status"]).contains("clean"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_git_import_keeps_main_empty_and_can_be_retried() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    fs::write(source.join("file"), "content").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "Root"]);
+    let original_root = String::from_utf8(git(&source, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let cacheinfo = format!("160000,{original_root},submodule");
+    git(
+        &source,
+        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+    );
+    git(&source, &["commit", "-m", "Add submodule"]);
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    for _ in 0..2 {
+        let failed = run(root, &["import-git", "source", &server.url]);
+        assert!(!failed.status.success());
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("submodules are unsupported"));
+        assert!(client.main_ref().await.unwrap().is_none());
+    }
+    scn(
+        root,
+        &["import-git", "source", &server.url, "--rev", &original_root],
+    );
+    assert!(client.main_ref().await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_import_keeps_distinct_commits_with_identical_author_and_file_metadata() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    git(&source, &["commit", "--allow-empty", "-m", "Root"]);
+    git(&source, &["branch", "side"]);
+    git(&source, &["commit", "--allow-empty", "-m", "Same change"]);
+    git(&source, &["checkout", "side"]);
+    git_env(
+        &source,
+        &["commit", "--allow-empty", "-m", "Same change"],
+        &[("GIT_COMMITTER_NAME", "Different Committer")],
+    );
+    git(&source, &["checkout", "main"]);
+    git(&source, &["merge", "--no-ff", "side", "-m", "Merge"]);
+    scn(root, &["import-git", "source", &server.url]);
+    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let tip = client.commit("main").await.unwrap();
+    assert_eq!(tip.parents.len(), 2);
+    let left = client.commit(&tip.parents[0]).await.unwrap();
+    let right = client.commit(&tip.parents[1]).await.unwrap();
+    assert_eq!(left.message, right.message);
+    assert_eq!(left.author, right.author);
+    assert_eq!(left.timestamp, right.timestamp);
+    assert_ne!(left.id, right.id);
+    assert_ne!(left.git_id, right.git_id);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_workflow_including_history_binary_files_and_checkout_protection() {
     let server = Server::start().await;
