@@ -1,65 +1,107 @@
 # scn
 
-A small, centralized source control system in Rust, inspired by [Scion](https://www.anthropic.com/engineering/redesigning-source-control). One binary provides the server and CLI.
+A centralized source control system in Rust, inspired by [Scion](https://www.anthropic.com/engineering/redesigning-source-control). Small clients, server-side commits, sparse working copies, and Zstandard compressed, content-addressed blobs.
 
 ## Architecture
 
-- **Client:** manages working files, sparse checkouts, and a 64 MiB compressed blob cache. History stays on the server.
-- **Server:** exposes commits, trees, history, diff, blame, merge, and rebase over HTTP.
-- **Storage:** SQLite holds changesets and `main`. Changesets contain file deltas; SHA-256 addressed, zlib compressed blobs live on disk.
+```mermaid
+flowchart LR
+    Client --> Controllers[Stateless controllers]
+    Controllers --> Valkey[Valkey: durable index and blob cache]
+    Controllers --> Shards[Independent SQLite WAL shards]
+    Shards --> Blobs[Local disk or S3]
+```
 
-`commit` creates an immutable changeset on the server. `land` separately advances `main` with compare-and-swap. There is no staging area or push.
+- `scn shard` stores file deltas and commit metadata in SQLite, plus blobs on disk or S3. Shards do not communicate with each other.
+- `scn cache` runs Valkey with AOF, RDB snapshots, configurable `maxmemory`, and `volatile-lru`. Requires `valkey-server` installed.
+- `scn shard controller` provides the source control API. Run multiple controllers against the same Valkey namespace. Controllers keep no local durable state.
 
-This is a single-server MVP for trusted use, without authentication or distributed storage. Trees are rebuilt from history on demand. Files are limited to 32 MiB, and merge conflicts are detected per file.
+Paths get permanent shard assignments through atomic Valkey scripts. New paths go to the shard with the fewest assigned paths, including historical paths. Adding a shard never moves existing paths. Commit and blob locations are indexed separately, allowing shared blobs to be deduplicated. File deltas are stored on their assigned shards before a commit header is published.
 
-## Quick start
+Index keys and `main` have no TTL. Only cached compressed blobs expire or can be evicted. Push updates `main` atomically after checking ancestry. Valkey is authoritative storage for the index, so back it up alongside shard databases and blobs. AOF defaults to `appendfsync always`; `--appendfsync everysec` trades durability for throughput.
+
+## Run locally
 
 ```sh
 cargo install --path .
 scn serve --store /tmp/scn-store
 ```
 
-In another terminal:
+`serve` is the standalone option: one process, SQLite, and local blobs. In another terminal:
 
 ```sh
 scn clone http://127.0.0.1:7878 /tmp/work
 cd /tmp/work
 printf 'hello\n' > hello.txt
+scn add .
 scn commit -m "Add greeting"
-scn land
+scn push
 ```
 
-Set `SCN_AUTHOR` or pass `commit --author` to choose your author identity.
+## Run with shards
 
-## Import a Git repository
-
-With the server running and its `main` still empty:
+Run each command in its own terminal:
 
 ```sh
-scn import-git /path/to/git-repo http://127.0.0.1:7878
-scn clone http://127.0.0.1:7878 /tmp/work
+scn cache --dir /data/cache --maxmemory 1gb
+scn shard --store /data/shard-a --listen 127.0.0.1:7879
+scn shard --store /data/shard-b --listen 127.0.0.1:7880
+scn shard controller --cache redis://127.0.0.1:6379/ --shard http://127.0.0.1:7879 --shard http://127.0.0.1:7880
 ```
 
-The importer reads `HEAD` by default; use `--rev main` to select another branch, tag, or commit. It preserves all reachable commits, author identities and timestamps, messages, empty commits, and merge parents. It prints the Git-to-scn ID mapping and advances `main` only after the whole import succeeds. Branch and tag refs are not copied.
+Clients connect to the controller on port 7878. Another controller can use the same `--cache` and `--namespace`, without repeating `--shard`. Set `--blob-ttl` in seconds to change the default 3600-second blob cache lifetime. Register a new shard by supplying its URL to any controller at startup. All controllers then use it for new assignments. Shard URLs must remain stable; removing or replacing a registered shard is not supported.
 
-Git must be installed. Bare repositories work. The source repository and uncommitted changes are left untouched. Shallow histories, symlinks, submodules, and merges with more than two parents are rejected. Commit metadata and paths must be UTF-8.
+Use separate shard directories and a separate Valkey namespace for each repository. Internal shard APIs and Valkey should be reachable only by trusted services. Authentication and automated failover are not implemented. Large history queries still walk the commit graph directly.
 
-## Daily use
+## S3 blobs
+
+Supply standard AWS credentials through environment variables, an AWS profile, or an instance role. The bucket must already exist:
+
+```sh
+scn shard --store /data/shard-a --s3-bucket my-bucket --s3-region eu-west-1 --s3-prefix my-repo/blobs
+```
+
+The same flags work with `serve`. Use `--s3-endpoint http://localhost:9000` for an S3-compatible service. Shards may share a bucket and prefix within one repository. SQLite stays on each shard; compressed blobs live in S3. Changing backends does not copy existing blobs.
+
+## Git-style workflow
 
 ```sh
 scn status
-scn diff
+scn add path/to/file
+scn diff --cached
 scn commit -m "Describe the change"
-scn log
-scn show HEAD path/to/file
-scn blame path/to/file
-scn land
+scn push
+scn fetch
+scn pull
 ```
 
-If another client lands first, run `scn rebase main` then `scn land`, or use `scn merge main` to retain both histories. Conflicts leave the working copy unchanged. Checkout, merge, rebase, and land require a clean working copy.
+`add` snapshots contents, so later edits remain unstaged. `commit -a` stages modified and deleted tracked files. `diff` shows unstaged tracked changes; `diff --cached` shows staged changes. `.gitignore` and `.scnignore` both work. Set `SCN_AUTHOR` or use `commit --author` for your identity.
 
-Use `clone --sparse src` or `checkout main --sparse src` for selected paths. Repeat `--sparse` for more paths; `checkout main --full` restores the full tree. Commits preserve omitted files. Revisions accept `HEAD`, `main`, or a full scn ID.
+Commits are created on the server immediately. `push` advances `main` to your current commit; `land` is an alias. `fetch` updates `origin/main` without touching working files. `pull` fetches and merges; use `pull --rebase` to replay your commits or `pull --ff-only` to reject divergence. Push works with uncommitted edits. Pull and checkout require a clean working copy.
 
-Add gitignore-style patterns to `.scnignore`. `.gitignore` is not read. Tracked files remain tracked when ignored.
+`log`, `show`, `blame`, `merge`, `rebase`, `checkout`, and `switch` are available. This MVP has one shared branch, `main`. Revisions accept `HEAD`, `main`, `origin/main`, or a full scn ID. There is no Git wire protocol or offline commit support.
 
-Run `scn --help` for commands. Validate changes with `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`.
+Use `clone --sparse src` or `checkout main --sparse src` for selected paths. Repeat `--sparse` for more paths; `checkout main --full` restores the full tree. Commits preserve omitted files. Files are limited to 32 MiB. Merges report conflicts per file.
+
+## Import Git history
+
+With an empty `main`:
+
+```sh
+scn import-git /path/to/git-repo http://127.0.0.1:7878 --rev main
+```
+
+Imports all reachable commits, author identities and timestamps, messages, empty commits, and merge parents. Original Git IDs are retained and mapped to scn IDs. `main` advances only after import succeeds. Bare repositories work; uncommitted changes are untouched. Branch and tag refs are not copied. Shallow histories, symlinks, submodules, and merges with more than two parents are unsupported. Metadata and paths must be UTF-8.
+
+New blobs use Zstandard. Existing zlib blobs and client caches are upgraded when read.
+
+## Development
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+SCN_VALKEY_SERVER=valkey-server cargo test --test cluster -- --ignored
+```
+
+Cluster tests use real Valkey processes, multiple controllers and shards, restart persistence, cache eviction, and concurrent writes. S3 tests use a local signed-request fixture.
