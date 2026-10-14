@@ -110,6 +110,6 @@
   <rect x="414" y="813" width="52" height="50" rx="12" fill="#7956db"/>
   <text x="440" y="845" text-anchor="middle" style="font-size:18px; font-weight:750; fill:white">S3</text>
   <text x="488" y="831" class="heading">Shared blob bucket</text>
-  <text x="488" y="862" class="small">Zstandard frames · addressed by SHA-256 of raw contents</text>
+  <text x="488" y="862" class="small">Zstandard chunks · addressed by SHA-256 of raw bytes</text>
   <text x="390" y="926" class="small">Local disk is also supported: each shard keeps blobs in its own directory.</text>
 </svg>
