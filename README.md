@@ -6,7 +6,7 @@ A centralized source control system in Rust, inspired by [Scion](https://www.ant
 
 ![scn architecture: CLI users and AI agents connect to stateless controllers, backed by a persistent Valkey index, independent SQLite shards, and S3 blob storage](docs/architecture.svg)
 
-- **Controllers** run commits, history queries, diff, blame, merge, and rebase. Multiple controllers share one repository without local durable state.
+- **Controllers** run commits, history queries, diff, blame, merge, and rebase. Multiple controllers share one repository without local durable state. Each keeps a bounded, disposable cache of reconstructed trees.
 - **Valkey** holds permanent shard assignments and `main`, plus compressed blobs with a configurable TTL. AOF and RDB persist the index; `volatile-lru` evicts only expiring cache entries.
 - **Shards** store immutable file deltas and commit headers in independent SQLite WAL databases. New paths go to the shard with the fewest assignments. Existing paths never move.
 - **Blob storage** is local disk per shard or a shared S3 bucket. IDs are SHA-256 hashes of raw contents. Stored and downloaded blobs use Zstandard only.
@@ -130,7 +130,7 @@ scn shard --store /data/shard-a --listen 0.0.0.0:7879 --s3-bucket my-bucket --s3
 
 For S3-compatible services, also pass `--s3-endpoint http://s3-host:9000`. The same storage flags work with `serve`. Changing backends does not copy blobs.
 
-Use a separate Valkey namespace, shard directories, and bucket prefix per repository. Valkey is authoritative routing storage: back it up with the shard databases and blob store. `scn cache` defaults to `appendfsync always`; `--appendfsync everysec` trades durability for throughput. This MVP has no authentication or automatic failover, and history queries still walk the graph directly.
+Use a separate Valkey namespace, shard directories, and bucket prefix per repository. Valkey is authoritative routing storage: back it up with the shard databases and blob store. `scn cache` defaults to `appendfsync always`; `--appendfsync everysec` trades durability for throughput. This MVP has no authentication or automatic failover. Uncached tree queries still replay first-parent history; ancestry queries read commit metadata without loading file deltas.
 
 ## Import Git history
 
@@ -152,6 +152,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 SCN_VALKEY_SERVER=valkey-server cargo test --test cluster -- --ignored
 docker compose config --quiet
+cargo run --release --example perf -- 500
 ```
 
 Cluster tests use real Valkey processes, multiple controllers and shards, restart persistence, eviction, and concurrent writes. S3 tests use a local signed-request fixture.
+
+The local performance example accepts a total commit count (default 500). It measures sequential commits, warm tree reads, direct-parent checks, and 1 MiB blob reads. Cluster throughput also depends on network latency and Valkey persistence settings.
