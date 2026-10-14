@@ -1,4 +1,4 @@
-use crate::{client::retry_delay, model::*, storage::Backend, store::decode_blob};
+use crate::{client::retry_delay, model::*, storage::Backend, store::verify_blob};
 use anyhow::{Context, Result, ensure};
 use redis::Commands;
 use reqwest::blocking::{Client, Response};
@@ -153,7 +153,7 @@ impl Backend for Cluster {
         let key = self.key(&format!("blob:{id}"));
         let mut connection = self.connection()?;
         if let Some(bytes) = connection.get::<_, Option<Vec<u8>>>(&key)? {
-            if decode_blob(&bytes, id).is_ok() {
+            if verify_blob(&bytes, id).is_ok() {
                 return Ok(bytes);
             }
             connection.del::<_, ()>(&key)?;
@@ -163,7 +163,7 @@ impl Backend for Cluster {
             Self::response(self.send(self.http.get(format!("{shard}/internal/blobs/{id}")))?)?
                 .bytes()?
                 .to_vec();
-        decode_blob(&bytes, id)?;
+        verify_blob(&bytes, id)?;
         let _: redis::RedisResult<()> = connection.set_ex(key, &bytes, self.blob_ttl);
         Ok(bytes)
     }

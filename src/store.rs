@@ -1,6 +1,7 @@
 use crate::model::*;
 use crate::storage::{Backend, Blobs, Local};
 use anyhow::{Context, Result, bail, ensure};
+use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -100,7 +101,7 @@ impl Store {
     pub fn compressed_blob(&self, id: &str) -> Result<Vec<u8>> {
         validate_id(id)?;
         let bytes = self.backend.blob(id)?;
-        decode_blob(&bytes, id)?;
+        verify_blob(&bytes, id)?;
         Ok(bytes)
     }
 
@@ -601,7 +602,9 @@ pub fn encode_blob(bytes: &[u8]) -> Result<Vec<u8>> {
 
 pub fn decode_blob(compressed: &[u8], id: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    zstd::stream::read::Decoder::new(compressed)?
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
+    decoder.window_log_max(25)?;
+    decoder
         .take((MAX_BLOB + 1) as u64)
         .read_to_end(&mut bytes)?;
     ensure!(
@@ -609,6 +612,28 @@ pub fn decode_blob(compressed: &[u8], id: &str) -> Result<Vec<u8>> {
         "blob integrity check failed: {id}"
     );
     Ok(bytes)
+}
+
+pub fn verify_blob(compressed: &[u8], id: &str) -> Result<usize> {
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
+    decoder.window_log_max(25)?;
+    let mut digest = Sha256::new();
+    let mut length = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = decoder.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        length += read;
+        ensure!(length <= MAX_BLOB, "blob exceeds 32 MiB limit");
+        digest.update(&buffer[..read]);
+    }
+    ensure!(
+        digest_hex(&digest.finalize()) == id,
+        "blob integrity check failed: {id}"
+    );
+    Ok(length)
 }
 
 pub fn patch(path: &str, before: &[u8], after: &[u8]) -> Option<String> {

@@ -2,7 +2,7 @@ use crate::{
     model::*,
     server::{ApiError, ApiState, blocking, limit_requests},
     storage::{Backend, Local},
-    store::{MAX_BLOB, decode_blob},
+    store::{MAX_BLOB, verify_blob},
 };
 use axum::{
     Json, Router,
@@ -34,7 +34,7 @@ async fn blob(
 ) -> Result<([(axum::http::HeaderName, &'static str); 2], Vec<u8>), ApiError> {
     let bytes = blocking(local, move |local| {
         let bytes = local.blobs.get(&id)?;
-        decode_blob(&bytes, &id)?;
+        verify_blob(&bytes, &id)?;
         Ok(bytes)
     })
     .await?;
@@ -54,7 +54,7 @@ async fn put_blob(
 ) -> Result<StatusCode, ApiError> {
     blocking(local, move |local| {
         validate_id(&id)?;
-        let size = decode_blob(&body, &id)?.len();
+        let size = verify_blob(&body, &id)?;
         local.put_blob(&id, &body, size, None)
     })
     .await?;

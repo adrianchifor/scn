@@ -454,6 +454,23 @@ fn blobs_use_only_zstandard_and_verify_contents() {
 }
 
 #[test]
+fn streamed_blob_verification_checks_hashes_sizes_and_complete_frames() {
+    use scn::store::{MAX_BLOB, encode_blob, verify_blob};
+    use std::io::{self, Read};
+
+    for size in [0, 1, MAX_BLOB] {
+        let bytes = vec![7; size];
+        let compressed = encode_blob(&bytes).unwrap();
+        assert_eq!(verify_blob(&compressed, &hash(&bytes)).unwrap(), size);
+        assert!(verify_blob(&compressed, &"0".repeat(64)).is_err());
+        assert!(verify_blob(&compressed[..compressed.len() - 1], &hash(&bytes)).is_err());
+    }
+    let oversized = zstd::stream::encode_all(io::repeat(0).take(MAX_BLOB as u64 + 1), 3).unwrap();
+    assert!(verify_blob(&oversized, &hash(b"")).is_err());
+    assert!(verify_blob(b"invalid frame", &hash(b"")).is_err());
+}
+
+#[test]
 fn tags_are_atomic_persistent_and_require_explicit_replacement() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();

@@ -160,8 +160,12 @@ pub struct BlameLine {
 }
 
 pub fn hash(bytes: &[u8]) -> String {
-    let mut result = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
+    digest_hex(&Sha256::digest(bytes))
+}
+
+pub(crate) fn digest_hex(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         result.push(b"0123456789abcdef"[(byte >> 4) as usize] as char);
         result.push(b"0123456789abcdef"[(byte & 15) as usize] as char);
     }

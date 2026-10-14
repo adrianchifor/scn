@@ -18,7 +18,7 @@ pub trait Backend: Send + Sync {
         if !self.has_blob(id)? {
             return Ok(None);
         }
-        Ok(Some(crate::store::decode_blob(&self.blob(id)?, id)?.len()))
+        Ok(Some(crate::store::verify_blob(&self.blob(id)?, id)?))
     }
     fn get_commit(&self, id: &str) -> Result<Commit>;
     fn parents(&self, id: &str) -> Result<Vec<String>> {
@@ -252,7 +252,7 @@ impl Backend for Local {
             ensure!(size as usize <= crate::store::MAX_BLOB, "invalid blob size");
             return Ok(Some(size as usize));
         }
-        let size = crate::store::decode_blob(&self.blobs.get(id)?, id)?.len();
+        let size = crate::store::verify_blob(&self.blobs.get(id)?, id)?;
         self.record_blob(id, size)?;
         Ok(Some(size))
     }
