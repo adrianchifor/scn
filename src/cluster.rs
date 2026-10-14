@@ -1,4 +1,4 @@
-use crate::{model::*, storage::Backend, store::decode_blob};
+use crate::{client::retry_delay, model::*, storage::Backend, store::decode_blob};
 use anyhow::{Context, Result, ensure};
 use redis::Commands;
 use reqwest::blocking::{Client, Response};
@@ -101,8 +101,24 @@ impl Cluster {
         Ok(response)
     }
 
+    fn send(&self, request: reqwest::blocking::RequestBuilder) -> Result<Response> {
+        for attempt in 0..6 {
+            let response = request
+                .try_clone()
+                .context("request body cannot be retried")?
+                .send()?;
+            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE || attempt == 5 {
+                return Ok(response);
+            }
+            let delay = retry_delay(response.headers(), attempt);
+            drop(response);
+            std::thread::sleep(delay);
+        }
+        unreachable!()
+    }
+
     fn get<T: DeserializeOwned>(&self, shard: &str, route: &str) -> Result<T> {
-        Ok(Self::response(self.http.get(format!("{shard}{route}")).send()?)?.json()?)
+        Ok(Self::response(self.send(self.http.get(format!("{shard}{route}")))?)?.json()?)
     }
 
     fn blob_shard(&self, id: &str) -> Result<String> {
@@ -121,10 +137,11 @@ impl Backend for Cluster {
             .transpose()?;
         let shard = self.allocate("blobs", id, preferred.as_deref())?;
         Self::response(
-            self.http
-                .put(format!("{shard}/internal/blobs/{id}"))
-                .body(bytes.to_owned())
-                .send()?,
+            self.send(
+                self.http
+                    .put(format!("{shard}/internal/blobs/{id}"))
+                    .body(bytes.to_owned()),
+            )?,
         )?;
         let _: redis::RedisResult<()> =
             self.connection()?
@@ -142,13 +159,10 @@ impl Backend for Cluster {
             connection.del::<_, ()>(&key)?;
         }
         let shard = self.blob_shard(id)?;
-        let bytes = Self::response(
-            self.http
-                .get(format!("{shard}/internal/blobs/{id}"))
-                .send()?,
-        )?
-        .bytes()?
-        .to_vec();
+        let bytes =
+            Self::response(self.send(self.http.get(format!("{shard}/internal/blobs/{id}")))?)?
+                .bytes()?
+                .to_vec();
         decode_blob(&bytes, id)?;
         let _: redis::RedisResult<()> = connection.set_ex(key, &bytes, self.blob_ttl);
         Ok(bytes)
@@ -158,10 +172,7 @@ impl Backend for Cluster {
         let Some(shard) = self.owner("blobs", id)? else {
             return Ok(false);
         };
-        let response = self
-            .http
-            .head(format!("{shard}/internal/blobs/{id}"))
-            .send()?;
+        let response = self.send(self.http.head(format!("{shard}/internal/blobs/{id}")))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -223,10 +234,11 @@ impl Backend for Cluster {
         }
         for (shard, changes) in groups {
             Self::response(
-                self.http
-                    .put(format!("{shard}/internal/changes/{}", commit.id))
-                    .json(&changes)
-                    .send()?,
+                self.send(
+                    self.http
+                        .put(format!("{shard}/internal/changes/{}", commit.id))
+                        .json(&changes),
+                )?,
             )?;
         }
         let shard = self.allocate("commits", &commit.id, None)?;
@@ -237,10 +249,11 @@ impl Backend for Cluster {
             paths: commit.changes.keys().cloned().collect(),
         };
         Self::response(
-            self.http
-                .put(format!("{shard}/internal/commits/{}", commit.id))
-                .json(&stored)
-                .send()?,
+            self.send(
+                self.http
+                    .put(format!("{shard}/internal/commits/{}", commit.id))
+                    .json(&stored),
+            )?,
         )?;
         Ok(())
     }

@@ -142,6 +142,8 @@ To download, fetch `manifest.chunks` in order, decompress and verify hashes and 
 
 Each request remains limited to 32 MiB (HTTP 413). Chunked files use binary diff and have no line blame.
 
+Servers admit eight concurrent API requests each. HTTP 503 means retry with backoff and honor `Retry-After`; CLI and controller requests retry automatically.
+
 ## Concurrent changes and errors
 
 If publishing returns 409, inspect the JSON `error`, read the latest `main`, and preserve your draft. To integrate, send `POST /v1/rebase` with `{"head":"DRAFT_ID","onto":"LATEST_MAIN_ID","author":"YOUR_IDENTITY"}`. Alternatively, `POST /v1/merge` accepts the same body and retains both parent histories. Both return a commit. Review/test the result, then publish its ID with `expected` set to the latest main ID used for integration. Bound retries and stop on unresolved file conflicts.

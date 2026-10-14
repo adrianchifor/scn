@@ -1,43 +1,34 @@
 use crate::{
     model::*,
-    server::ApiError,
+    server::{ApiError, ApiState, blocking, limit_requests},
     storage::Local,
     store::{MAX_BLOB, decode_blob},
 };
-use anyhow::Result;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path},
     http::{StatusCode, header},
     routing::get,
 };
 
-async fn blocking<T: Send + 'static>(
-    local: Local,
-    work: impl FnOnce(Local) -> Result<T> + Send + 'static,
-) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(move || work(local))
-        .await
-        .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .map_err(Into::into)
-}
-
 pub fn router(local: Local) -> Router {
-    Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route(
-            "/internal/blobs/{id}",
-            get(blob).put(put_blob).head(has_blob),
-        )
-        .route("/internal/commits/{id}", get(commit).put(put_commit))
-        .route("/internal/changes/{id}", get(changes).put(put_changes))
-        .layer(DefaultBodyLimit::max(MAX_BLOB + 128 * 1024))
-        .with_state(local)
+    limit_requests(
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/internal/blobs/{id}",
+                get(blob).put(put_blob).head(has_blob),
+            )
+            .route("/internal/commits/{id}", get(commit).put(put_commit))
+            .route("/internal/changes/{id}", get(changes).put(put_changes))
+            .layer(DefaultBodyLimit::max(MAX_BLOB + 128 * 1024))
+            .with_state(local),
+    )
 }
 
 async fn blob(
-    State(local): State<Local>,
+    local: ApiState<Local>,
     Path(id): Path<String>,
 ) -> Result<([(axum::http::HeaderName, &'static str); 2], Vec<u8>), ApiError> {
     let bytes = blocking(local, move |local| {
@@ -56,7 +47,7 @@ async fn blob(
 }
 
 async fn put_blob(
-    State(local): State<Local>,
+    local: ApiState<Local>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -69,10 +60,7 @@ async fn put_blob(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn has_blob(
-    State(local): State<Local>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+async fn has_blob(local: ApiState<Local>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
     Ok(
         if blocking(local, move |local| local.blobs.contains(&id)).await? {
             StatusCode::NO_CONTENT
@@ -83,14 +71,14 @@ async fn has_blob(
 }
 
 async fn commit(
-    State(local): State<Local>,
+    local: ApiState<Local>,
     Path(id): Path<String>,
 ) -> Result<Json<StoredCommit>, ApiError> {
     Ok(Json(blocking(local, move |local| local.header(&id)).await?))
 }
 
 async fn put_commit(
-    State(local): State<Local>,
+    local: ApiState<Local>,
     Path(id): Path<String>,
     Json(header): Json<StoredCommit>,
 ) -> Result<StatusCode, ApiError> {
@@ -99,7 +87,7 @@ async fn put_commit(
 }
 
 async fn changes(
-    State(local): State<Local>,
+    local: ApiState<Local>,
     Path(id): Path<String>,
 ) -> Result<Json<Changes>, ApiError> {
     Ok(Json(
@@ -108,7 +96,7 @@ async fn changes(
 }
 
 async fn put_changes(
-    State(local): State<Local>,
+    local: ApiState<Local>,
     Path(id): Path<String>,
     Json(changes): Json<Changes>,
 ) -> Result<StatusCode, ApiError> {

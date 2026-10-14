@@ -57,16 +57,30 @@ impl Client {
         Ok(response)
     }
 
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<Response> {
+        for attempt in 0..6 {
+            let response = request
+                .try_clone()
+                .context("request body cannot be retried")?
+                .send()
+                .await?;
+            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE || attempt == 5 {
+                return Ok(response);
+            }
+            let delay = retry_delay(response.headers(), attempt);
+            drop(response);
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!()
+    }
+
     pub async fn get<T: DeserializeOwned>(
         &self,
         route: &str,
         query: &[(&str, String)],
     ) -> Result<T> {
         let response = self
-            .http
-            .get(format!("{}{route}", self.url))
-            .query(query)
-            .send()
+            .send(self.http.get(format!("{}{route}", self.url)).query(query))
             .await
             .context("could not reach scn server")?;
         Ok(Self::response(response).await?.json().await?)
@@ -74,10 +88,7 @@ impl Client {
 
     pub async fn post<T: DeserializeOwned>(&self, route: &str, body: &impl Serialize) -> Result<T> {
         let response = self
-            .http
-            .post(format!("{}{route}", self.url))
-            .json(body)
-            .send()
+            .send(self.http.post(format!("{}{route}", self.url)).json(body))
             .await
             .context("could not reach scn server")?;
         Ok(Self::response(response).await?.json().await?)
@@ -136,9 +147,7 @@ impl Client {
     pub async fn has_blob(&self, id: &str) -> Result<bool> {
         validate_id(id)?;
         let response = self
-            .http
-            .head(format!("{}/v1/blobs/{id}", self.url))
-            .send()
+            .send(self.http.head(format!("{}/v1/blobs/{id}", self.url)))
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
@@ -171,7 +180,7 @@ impl Client {
         if let Some(path) = path {
             request = request.query(&[("path", path)]);
         }
-        let response = request.body(bytes).send().await?;
+        let response = self.send(request.body(bytes)).await?;
         let id = Self::response(response)
             .await?
             .json::<RefValue>()
@@ -201,9 +210,7 @@ impl Client {
             }
         }
         let response = self
-            .http
-            .get(format!("{}/v1/blobs/{id}", self.url))
-            .send()
+            .send(self.http.get(format!("{}/v1/blobs/{id}", self.url)))
             .await?;
         let compressed = Self::response(response).await?.bytes().await?;
         let bytes = decode_blob(&compressed, id)?;
@@ -271,9 +278,10 @@ impl Client {
     pub async fn delete_tag(&self, name: &str) -> Result<()> {
         validate_tag_name(name)?;
         let response = self
-            .http
-            .delete(format!("{}/v1/tags/{}", self.url, revision_segment(name)?))
-            .send()
+            .send(
+                self.http
+                    .delete(format!("{}/v1/tags/{}", self.url, revision_segment(name)?)),
+            )
             .await?;
         Self::response(response).await?;
         Ok(())
@@ -281,14 +289,30 @@ impl Client {
 
     pub async fn update_main(&self, expected: Option<String>, target: String) -> Result<()> {
         let response = self
-            .http
-            .post(format!("{}/v1/refs/main", self.url))
-            .json(&RefUpdate { expected, target })
-            .send()
+            .send(
+                self.http
+                    .post(format!("{}/v1/refs/main", self.url))
+                    .json(&RefUpdate { expected, target }),
+            )
             .await?;
         Self::response(response).await?;
         Ok(())
     }
+}
+
+pub(crate) fn retry_delay(headers: &reqwest::header::HeaderMap, attempt: u32) -> Duration {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
+        .unwrap_or(1)
+        .clamp(1, 30)
+        .max(1 << attempt.min(2));
+    let jitter = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        % 250;
+    Duration::from_millis(seconds * 1000 + jitter)
 }
 
 pub fn validate_revision(revision: &str) -> Result<()> {
