@@ -2,13 +2,13 @@
 name = "scn"
 version = "0.1.0"
 edition = "2024"
-description = "A small, centralized source control system"
+description = "Scalable source control system in Rust, inspired by Scion"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
-clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 globset = "0.4"
 ignore = "0.4"
@@ -22,6 +22,11 @@ serde_json = "1"
 sha2 = "0.11"
 similar = "3"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
-zstd = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+zstd = { version = "0.14", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 

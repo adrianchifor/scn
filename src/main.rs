@@ -10,7 +10,7 @@ use scn::{
 use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
-#[command(name = "scn", version, about = "Small, centralized source control")]
+#[command(name = "scn", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

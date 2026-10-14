@@ -1,6 +1,6 @@
 # scn
 
-A centralized source control system in Rust, inspired by [Scion](https://www.anthropic.com/engineering/redesigning-source-control). Git-style CLI commands and an HTTP API for agents, with server-side commits, sparse checkouts, and chunked storage for gigabyte-scale binaries and datasets.
+Scalable source control system in Rust, inspired by [Scion](https://www.anthropic.com/engineering/redesigning-source-control). Git-style CLI commands and an HTTP API for agents, with server-side commits, sparse checkouts, and chunked storage for gigabyte-scale binaries and datasets.
 
 Its stateless controllers, SQLite shards, and S3 storage can potentially scale to multi-terabyte monorepos and thousands of concurrent users and agents.
 
@@ -14,6 +14,28 @@ Its stateless controllers, SQLite shards, and S3 storage can potentially scale t
 - **Blob storage** is local disk per shard or a shared S3 bucket. Files over 32 MiB use 8 MiB chunks and a manifest. Chunks are addressed by SHA-256, deduplicated, and Zstandard compressed. New chunks can be distributed across shards.
 
 `commit` creates an immutable changeset on the server. `push` separately advances `main` with compare-and-swap. Agents can do both entirely through the API, without a checkout. See [AGENTS.md](AGENTS.md) for the client and API guide.
+
+## Install
+
+Use the release binary for your platform. No Rust toolchain is required.
+
+| Platform | Download |
+| --- | --- |
+| Linux amd64 | [scn-linux-amd64](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-linux-amd64) |
+| Linux arm64 | [scn-linux-arm64](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-linux-arm64) |
+| macOS arm64 | [scn-macos-arm64](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-macos-arm64) |
+
+Install your chosen binary, for example on Apple Silicon:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fL https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-macos-arm64 -o ~/.local/bin/scn
+chmod +x ~/.local/bin/scn
+export PATH="$HOME/.local/bin:$PATH"
+scn --version
+```
+
+Linux binaries are statically linked. Checksums are in [SHA256SUMS](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/SHA256SUMS).
 
 ## Local cluster with Docker Compose
 
@@ -48,10 +70,9 @@ docker compose -f deploy/compose.yaml down
 
 ## Point the CLI at a controller
 
-Install the CLI and clone through the gateway or your existing controller:
+After installing scn, clone through the gateway or your existing controller:
 
 ```sh
-cargo install --path . --locked
 scn clone http://127.0.0.1:7878 ./work
 cd work
 scn remote -v
@@ -123,7 +144,7 @@ Tags default to `HEAD`. Use `-a -m` for annotations, `-f` to replace, and `-d` t
 
 ## Run a cluster without Docker
 
-Install Rust, Git, and `valkey-server`, then run `cargo install --path . --locked`. Run each server command in its own terminal, in this order:
+Install scn as above, Git, and `valkey-server`. Run each server command in its own terminal, in this order:
 
 ```sh
 scn cache --dir /tmp/scn-cache --listen 127.0.0.1:6379 --maxmemory 1gb
@@ -175,6 +196,7 @@ scn import-git /path/to/git-repo http://127.0.0.1:7878 --rev main
 ## Development
 
 ```sh
+cargo build --release --locked
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
@@ -184,6 +206,6 @@ SCN_PERF_COMMITS=500 cargo test --release --test perf -- --ignored --nocapture
 cargo test --release --test large_files -- --ignored
 ```
 
-Tests cover cluster persistence, eviction, concurrent writes, S3 requests, and chunked files. The separate large-file test streams 5 GiB of repeated data with bounded buffers and deduplication.
+Tests cover cluster persistence, eviction, concurrent writes, S3 requests, and chunked files. Cluster tests include four concurrent 1 GiB transfers; the separate large-file test streams 5 GiB of repeated data.
 
 The local performance test uses `SCN_PERF_COMMITS` for the total commit count (default 500). It measures sequential commits, warm tree reads, direct-parent checks, and 1 MiB blob reads. Cluster throughput also depends on network latency and Valkey persistence settings.
