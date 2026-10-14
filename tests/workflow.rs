@@ -562,3 +562,40 @@ async fn staging_respects_gitignore_subdirectories_and_deletions() {
     scn(&work, &["commit", "-m", "delete"]);
     assert!(scn(&work, &["status"]).contains("clean"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_endpoint_is_saved_and_can_be_changed_without_losing_work() {
+    let server = Server::start().await;
+    let root = server.directory.path();
+    scn(root, &["clone", &server.url, "work"]);
+    let work = root.join("work");
+    assert_eq!(
+        scn(&work, &["remote", "get-url", "origin"]).trim(),
+        server.url
+    );
+    assert!(scn(&work, &["remote", "-v"]).contains(&server.url));
+    fs::write(work.join("pending"), "staged").unwrap();
+    scn(&work, &["add", "pending"]);
+    assert!(
+        !run(&work, &["remote", "set-url", "origin", "file:///tmp"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        scn(&work, &["remote", "get-url", "origin"]).trim(),
+        server.url
+    );
+    scn(
+        &work,
+        &["remote", "set-url", "origin", "http://127.0.0.1:1/"],
+    );
+    assert_eq!(
+        scn(&work, &["remote", "get-url", "origin"]).trim(),
+        "http://127.0.0.1:1"
+    );
+    assert!(scn(&work, &["status"]).contains("A  pending"));
+    scn(&work, &["remote", "set-url", "origin", &server.url]);
+    scn(&work, &["commit", "-m", "keep staged work"]);
+    scn(&work, &["push"]);
+    assert!(scn(&work, &["status"]).contains("clean"));
+}

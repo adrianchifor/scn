@@ -77,6 +77,19 @@ enum ShardCommand {
 }
 
 #[derive(Subcommand)]
+enum RemoteCommand {
+    GetUrl {
+        #[arg(default_value = "origin", value_parser = ["origin"])]
+        remote: String,
+    },
+    SetUrl {
+        #[arg(value_parser = ["origin"])]
+        remote: String,
+        url: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     #[command(about = "Run a SQLite storage shard or shard controller")]
     Shard(ShardArgs),
@@ -120,6 +133,13 @@ enum Command {
     },
     #[command(about = "Show added, modified, and deleted files")]
     Status,
+    #[command(about = "Show or change the working copy's controller endpoint")]
+    Remote {
+        #[arg(short, long)]
+        verbose: bool,
+        #[command(subcommand)]
+        command: Option<RemoteCommand>,
+    },
     #[command(about = "Stage file contents and deletions for the next commit")]
     Add {
         #[arg(required_unless_present = "all")]
@@ -127,7 +147,7 @@ enum Command {
         #[arg(short = 'A', long)]
         all: bool,
     },
-    #[command(about = "Create a server-side changeset from all local changes")]
+    #[command(about = "Create a server-side changeset from staged changes")]
     Commit {
         #[arg(short, long)]
         message: String,
@@ -322,6 +342,23 @@ async fn main() -> Result<()> {
     }
     let mut workspace = Workspace::find(&std::env::current_dir()?)?;
     let _lock = workspace.lock()?;
+    if let Command::Remote { verbose, command } = command {
+        match command {
+            Some(RemoteCommand::SetUrl { url, .. }) => {
+                scn::client::Client::new(&url, &workspace.root.join(".scn/cache"))?;
+                workspace.state.server = url.trim_end_matches('/').to_owned();
+                workspace.state.remote_main = None;
+                workspace.save()?;
+            }
+            Some(RemoteCommand::GetUrl { .. }) => println!("{}", workspace.state.server),
+            None if verbose => {
+                println!("origin\t{} (fetch)", workspace.state.server);
+                println!("origin\t{} (push)", workspace.state.server);
+            }
+            None => println!("origin"),
+        }
+        return Ok(());
+    }
     let client = workspace.client()?;
     let rebase = matches!(&command, Command::Rebase { .. });
     match command {
