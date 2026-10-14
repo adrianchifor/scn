@@ -1,0 +1,142 @@
+name: scn
+
+x-scn: &scn
+  build: .
+  image: scn:local
+  restart: unless-stopped
+
+x-s3-environment: &s3-environment
+  AWS_ACCESS_KEY_ID: ${SCN_S3_ACCESS_KEY:-SCNLOCAL}
+  AWS_SECRET_ACCESS_KEY: ${SCN_S3_SECRET_KEY:-scn-local-secret-change-me}
+  AWS_DEFAULT_REGION: us-east-1
+
+x-shard: &shard
+  <<: *scn
+  command:
+    - shard
+    - --store
+    - /data
+    - --listen
+    - 0.0.0.0:7878
+    - --s3-bucket
+    - scn
+    - --s3-region
+    - us-east-1
+    - --s3-endpoint
+    - http://s3:9000
+    - --s3-prefix
+    - local/blobs
+  environment: *s3-environment
+  depends_on:
+    bucket-init:
+      condition: service_completed_successfully
+
+x-controller: &controller
+  <<: *scn
+  command:
+    - shard
+    - controller
+    - --listen
+    - 0.0.0.0:7878
+    - --cache
+    - redis://cache:6379/
+    - --namespace
+    - local
+    - --blob-ttl
+    - "3600"
+    - --shard
+    - http://shard-a:7878
+    - --shard
+    - http://shard-b:7878
+  depends_on:
+    cache:
+      condition: service_healthy
+    shard-a:
+      condition: service_healthy
+    shard-b:
+      condition: service_healthy
+
+services:
+  cache:
+    image: valkey/valkey:9.0.6-alpine
+    command: [valkey-server, --bind, 0.0.0.0, --protected-mode, "no", --appendonly, "yes", --appendfsync, always, --save, "900 1 300 10 60 10000", --maxmemory, "${SCN_CACHE_MEMORY:-256mb}", --maxmemory-policy, volatile-lru]
+    volumes:
+      - cache-data:/data
+    healthcheck:
+      test: [CMD, valkey-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  s3:
+    image: rustfs/rustfs:1.0.1
+    command: [/data]
+    environment:
+      RUSTFS_ACCESS_KEY: ${SCN_S3_ACCESS_KEY:-SCNLOCAL}
+      RUSTFS_SECRET_KEY: ${SCN_S3_SECRET_KEY:-scn-local-secret-change-me}
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - s3-data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:9000/health/ready]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+
+  bucket-init:
+    image: amazon/aws-cli:2
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - aws --endpoint-url http://s3:9000 s3api head-bucket --bucket scn >/dev/null 2>&1 || aws --endpoint-url http://s3:9000 s3api create-bucket --bucket scn
+    environment: *s3-environment
+    depends_on:
+      s3:
+        condition: service_healthy
+
+  shard-a:
+    <<: *shard
+    volumes:
+      - shard-a-data:/data
+
+  shard-b:
+    <<: *shard
+    volumes:
+      - shard-b-data:/data
+
+  controller-a:
+    <<: *controller
+
+  controller-b:
+    <<: *controller
+
+  gateway:
+    image: nginx:1.28-alpine
+    ports:
+      - "127.0.0.1:7878:7878"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      controller-a:
+        condition: service_healthy
+      controller-b:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:7878/health]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  cache-data:
+  s3-data:
+  shard-a-data:
+  shard-b-data:
