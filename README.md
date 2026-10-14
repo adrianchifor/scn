@@ -1,87 +1,136 @@
 # scn
 
-A centralized source control system in Rust, inspired by [Scion](https://www.anthropic.com/engineering/redesigning-source-control). Small clients, server-side commits, sparse working copies, and Zstandard compressed, content-addressed blobs.
+A centralized source control system in Rust, inspired by [Scion](https://www.anthropic.com/engineering/redesigning-source-control). Git-style CLI commands and an HTTP API for agents, with server-side commits, sparse checkouts, and Zstandard compressed blobs.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Client --> Controllers[Stateless controllers]
-    Controllers --> Valkey[Valkey: durable index and blob cache]
-    Controllers --> Shards[Independent SQLite WAL shards]
-    Shards --> Blobs[Local disk or S3]
-```
+![scn architecture: CLI users and AI agents connect to stateless controllers, backed by a persistent Valkey index, independent SQLite shards, and S3 blob storage](docs/architecture.svg)
 
-- `scn shard` stores file deltas and commit metadata in SQLite, plus blobs on disk or S3. Shards do not communicate with each other.
-- `scn cache` runs Valkey with AOF, RDB snapshots, configurable `maxmemory`, and `volatile-lru`. Requires `valkey-server` installed.
-- `scn shard controller` provides the source control API. Run multiple controllers against the same Valkey namespace. Controllers keep no local durable state.
+- **Controllers** run commits, history queries, diff, blame, merge, and rebase. Multiple controllers share one repository without local durable state.
+- **Valkey** holds permanent shard assignments and `main`, plus compressed blobs with a configurable TTL. AOF and RDB persist the index; `volatile-lru` evicts only expiring cache entries.
+- **Shards** store immutable file deltas and commit headers in independent SQLite WAL databases. New paths go to the shard with the fewest assignments. Existing paths never move.
+- **Blob storage** is local disk per shard or a shared S3 bucket. IDs are SHA-256 hashes of raw contents. Stored and downloaded blobs use Zstandard only.
 
-Paths get permanent shard assignments through atomic Valkey scripts. New paths go to the shard with the fewest assigned paths, including historical paths. Adding a shard never moves existing paths. Commit and blob locations are indexed separately, allowing shared blobs to be deduplicated. File deltas are stored on their assigned shards before a commit header is published.
+`commit` creates an immutable changeset on the server. `push` separately advances `main` with compare-and-swap. Agents can do both entirely through the API, without a checkout. See [AGENTS.md](AGENTS.md) for the client and API guide.
 
-Index keys and `main` have no TTL. Only cached compressed blobs expire or can be evicted. Push updates `main` atomically after checking ancestry. Valkey is authoritative storage for the index, so back it up alongside shard databases and blobs. AOF defaults to `appendfsync always`; `--appendfsync everysec` trades durability for throughput.
+## Local cluster with Docker Compose
 
-## Run locally
+Requires Docker with Compose. From this repository:
 
 ```sh
-cargo install --path .
-scn serve --store /tmp/scn-store
+docker compose up --build -d --wait
+docker compose ps
+curl --fail http://127.0.0.1:7878/health
 ```
 
-`serve` is the standalone option: one process, SQLite, and local blobs. In another terminal:
+[compose.yaml](compose.yaml) starts two controllers behind an Nginx gateway, two SQLite shards, persistent Valkey, and [RustFS](https://docs.rustfs.com/en/installation/container/docker), an S3-compatible store. An initialization job creates the `scn` bucket before shards start.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `http://127.0.0.1:7878` | CLI and controller API, balanced across both controllers |
+| `http://127.0.0.1:9000` | Local S3 API |
+| `http://127.0.0.1:9001` | S3 web console |
+
+Local S3 credentials default to `SCNLOCAL` / `scn-local-secret-change-me`. Override them with `SCN_S3_ACCESS_KEY` and `SCN_S3_SECRET_KEY` before starting the stack. `SCN_CACHE_MEMORY` sets Valkey's memory limit, default `256mb`. Only the gateway and S3 ports are published, bound to loopback.
+
+Each shard has its own volume. Valkey and S3 also have persistent volumes. Inspect or stop the stack with:
 
 ```sh
-scn clone http://127.0.0.1:7878 /tmp/work
-cd /tmp/work
-printf 'hello\n' > hello.txt
-scn add .
-scn commit -m "Add greeting"
-scn push
+docker compose logs -f controller-a shard-a
+docker compose down
 ```
 
-## Run with shards
+`down` keeps data. `docker compose down -v` deletes the repository, index, and blobs.
 
-Run each command in its own terminal:
+## Point the CLI at a controller
+
+Install the CLI and clone through the gateway or your existing controller:
 
 ```sh
-scn cache --dir /data/cache --maxmemory 1gb
-scn shard --store /data/shard-a --listen 127.0.0.1:7879
-scn shard --store /data/shard-b --listen 127.0.0.1:7880
-scn shard controller --cache redis://127.0.0.1:6379/ --shard http://127.0.0.1:7879 --shard http://127.0.0.1:7880
+cargo install --path . --locked
+scn clone http://127.0.0.1:7878 ./work
+cd work
+scn remote -v
+scn remote get-url origin
 ```
 
-Clients connect to the controller on port 7878. Another controller can use the same `--cache` and `--namespace`, without repeating `--shard`. Set `--blob-ttl` in seconds to change the default 3600-second blob cache lifetime. Register a new shard by supplying its URL to any controller at startup. All controllers then use it for new assignments. Shard URLs must remain stable; removing or replacing a registered shard is not supported.
-
-Use separate shard directories and a separate Valkey namespace for each repository. Internal shard APIs and Valkey should be reachable only by trusted services. Authentication and automated failover are not implemented. Large history queries still walk the commit graph directly.
-
-## S3 blobs
-
-Supply standard AWS credentials through environment variables, an AWS profile, or an instance role. The bucket must already exist:
+The clone saves the endpoint in `.scn/state.json`. Later commands use it automatically. To select another controller for the same repository:
 
 ```sh
-scn shard --store /data/shard-a --s3-bucket my-bucket --s3-region eu-west-1 --s3-prefix my-repo/blobs
+scn remote set-url origin https://scn.example.com
+scn fetch
 ```
 
-The same flags work with `serve`. Use `--s3-endpoint http://localhost:9000` for an S3-compatible service. Shards may share a bucket and prefix within one repository. SQLite stays on each shard; compressed blobs live in S3. Changing backends does not copy existing blobs.
+Changing the endpoint preserves staged changes and working files, and clears the cached `origin/main` value. There is one remote, `origin`, and one shared branch, `main`.
 
 ## Git-style workflow
 
 ```sh
+printf 'hello\n' > hello.txt
 scn status
-scn add path/to/file
+scn add hello.txt
 scn diff --cached
-scn commit -m "Describe the change"
-scn push
-scn fetch
-scn pull
+scn commit -m "Add greeting"
+scn push origin main
+scn log -n 5
+scn show HEAD hello.txt
 ```
 
-`add` snapshots contents, so later edits remain unstaged. `commit -a` stages modified and deleted tracked files. `diff` shows unstaged tracked changes; `diff --cached` shows staged changes. `.gitignore` and `.scnignore` both work. Set `SCN_AUTHOR` or use `commit --author` for your identity.
+`add` snapshots contents. Later edits stay unstaged. `commit -am "Update tracked files"` stages modifications and deletions of tracked files. `diff` shows unstaged tracked changes; `diff --cached` shows staged changes. `.gitignore` and `.scnignore` both work. Set `SCN_AUTHOR` or pass `commit --author` for your identity.
 
-Commits are created on the server immediately. `push` advances `main` to your current commit; `land` is an alias. `fetch` updates `origin/main` without touching working files. `pull` fetches and merges; use `pull --rebase` to replay your commits or `pull --ff-only` to reject divergence. Push works with uncommitted edits. Pull and checkout require a clean working copy.
+Synchronize with other clients:
 
-`log`, `show`, `blame`, `merge`, `rebase`, `checkout`, and `switch` are available. This MVP has one shared branch, `main`. Revisions accept `HEAD`, `main`, `origin/main`, or a full scn ID. There is no Git wire protocol or offline commit support.
+```sh
+scn fetch
+scn log origin/main -n 5
+scn pull --ff-only
+```
 
-Use `clone --sparse src` or `checkout main --sparse src` for selected paths. Repeat `--sparse` for more paths; `checkout main --full` restores the full tree. Commits preserve omitted files. Files are limited to 32 MiB. Merges report conflicts per file.
+`fetch` updates `origin/main` without changing files. `pull` fetches and merges. If histories diverge, use `scn pull --rebase` to replay your commits, then `scn push`. Push works with uncommitted edits; pull and checkout require a clean working copy. File conflicts leave working files unchanged.
+
+For sparse working copies:
+
+```sh
+scn clone http://127.0.0.1:7878 ./agent-work --sparse src --sparse Cargo.toml
+cd agent-work
+scn checkout main --sparse docs
+scn checkout main --full
+```
+
+Commits preserve omitted files. Revisions accept `HEAD`, `main`, `origin/main`, or a full scn ID. `checkout` has a `switch` alias; `push` has a `land` alias. There is no Git wire protocol or offline commit support.
+
+## Run a cluster without Docker
+
+Install Rust, Git, and `valkey-server`, then run `cargo install --path . --locked`. Run each server command in its own terminal, in this order:
+
+```sh
+scn cache --dir /tmp/scn-cache --listen 127.0.0.1:6379 --maxmemory 1gb
+scn shard --store /tmp/scn-shard-a --listen 127.0.0.1:7879
+scn shard --store /tmp/scn-shard-b --listen 127.0.0.1:7880
+scn shard controller --listen 127.0.0.1:7878 --cache redis://127.0.0.1:6379/ --namespace demo --shard http://127.0.0.1:7879 --shard http://127.0.0.1:7880
+```
+
+These commands use local blob storage. A second controller can discover registered shards from Valkey:
+
+```sh
+scn shard controller --listen 127.0.0.1:7881 --cache redis://127.0.0.1:6379/ --namespace demo --blob-ttl 600
+```
+
+Clients can use either controller, or a load balancer in front of them. Register another running shard by passing its URL with `--shard` when starting any controller. All controllers then allocate new paths to it without rebalancing. Shard URLs must remain stable; shard removal is not supported.
+
+For a single process without Valkey, use `scn serve --store /tmp/scn-store`.
+
+## Use an existing S3 bucket
+
+The bucket must exist. Supply AWS credentials through environment variables, an AWS profile, or an instance role. Start each shard with its own SQLite directory and a shared bucket/prefix:
+
+```sh
+scn shard --store /data/shard-a --listen 0.0.0.0:7879 --s3-bucket my-bucket --s3-region eu-west-1 --s3-prefix my-repo/blobs
+```
+
+For S3-compatible services, also pass `--s3-endpoint http://s3-host:9000`. The same storage flags work with `serve`. Changing backends does not copy blobs.
+
+Use a separate Valkey namespace, shard directories, and bucket prefix per repository. Valkey is authoritative routing storage: back it up with the shard databases and blob store. `scn cache` defaults to `appendfsync always`; `--appendfsync everysec` trades durability for throughput. This MVP has no authentication or automatic failover, and history queries still walk the graph directly.
 
 ## Import Git history
 
@@ -91,9 +140,9 @@ With an empty `main`:
 scn import-git /path/to/git-repo http://127.0.0.1:7878 --rev main
 ```
 
-Imports all reachable commits, author identities and timestamps, messages, empty commits, and merge parents. Original Git IDs are retained and mapped to scn IDs. `main` advances only after import succeeds. Bare repositories work; uncommitted changes are untouched. Branch and tag refs are not copied. Shallow histories, symlinks, submodules, and merges with more than two parents are unsupported. Metadata and paths must be UTF-8.
+Imports reachable commits, authors and timestamps, messages, empty commits, and merge parents. Original Git IDs are retained; `main` advances only after success. Bare repositories work and uncommitted files are untouched. Branch and tag refs are not copied.
 
-New blobs use Zstandard. Existing zlib blobs and client caches are upgraded when read.
+Files are limited to 32 MiB. Paths and commit metadata must be UTF-8. Symlinks, submodules, shallow imports, and merges with more than two parents are unsupported.
 
 ## Development
 
@@ -102,6 +151,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 SCN_VALKEY_SERVER=valkey-server cargo test --test cluster -- --ignored
+docker compose config --quiet
 ```
 
-Cluster tests use real Valkey processes, multiple controllers and shards, restart persistence, cache eviction, and concurrent writes. S3 tests use a local signed-request fixture.
+Cluster tests use real Valkey processes, multiple controllers and shards, restart persistence, eviction, and concurrent writes. S3 tests use a local signed-request fixture.

@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="960" viewBox="0 0 1320 960" role="img" aria-labelledby="title description">
+  <title id="title">scn architecture</title>
+  <desc id="description">CLI users and AI agents share one HTTP endpoint backed by stateless controllers. Controllers coordinate through persistent Valkey and route immutable file deltas to independent SQLite WAL shards. Shards store Zstandard compressed blobs in a shared S3 bucket. New paths are assigned to the least-loaded shard without moving existing paths.</desc>
+  <defs>
+    <linearGradient id="background" x2="0" y2="1">
+      <stop stop-color="#f5f8ff"/>
+      <stop offset="1" stop-color="#ffffff"/>
+    </linearGradient>
+    <filter id="shadow" x="-15%" y="-20%" width="130%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="10" flood-color="#24365d" flood-opacity="0.06"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7185a4"/>
+    </marker>
+    <marker id="blue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#356ce8"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #192b48; }
+      .small { font-size: 14px; fill: #5b6d87; }
+      .label { font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; }
+      .wire { fill: none; stroke: #7185a4; stroke-width: 2; marker-end: url(#arrow); }
+      .request { fill: none; stroke: #356ce8; stroke-width: 2.5; marker-end: url(#blue-arrow); }
+      .card { fill: white; stroke: #dce4f1; filter: url(#shadow); }
+    </style>
+  </defs>
+
+  <rect width="1320" height="960" rx="24" fill="url(#background)"/>
+  <rect x="56" y="44" width="54" height="36" rx="10" fill="#192b48"/>
+  <text x="83" y="68" text-anchor="middle" style="font-size:20px; font-weight:750; fill:white">scn</text>
+  <text x="126" y="70" style="font-size:32px; font-weight:750">Source control as a service</text>
+  <text x="56" y="109" style="font-size:17px; fill:#5b6d87">Small clients. Stateless compute. Durable, independently scalable storage.</text>
+
+  <text x="56" y="157" class="label" style="fill:#356ce8">USERS</text>
+  <rect x="56" y="180" width="240" height="110" rx="16" class="card"/>
+  <rect x="76" y="200" width="38" height="34" rx="8" fill="#eef3ff"/>
+  <text x="95" y="223" text-anchor="middle" class="mono" style="fill:#356ce8; font-weight:700">&gt;_</text>
+  <text x="128" y="222" class="heading">scn CLI</text>
+  <text x="76" y="263" class="small">Stage · commit · push · pull</text>
+
+  <rect x="56" y="326" width="240" height="110" rx="16" class="card"/>
+  <rect x="76" y="346" width="38" height="34" rx="8" fill="#eef3ff"/>
+  <text x="95" y="369" text-anchor="middle" class="mono" style="fill:#356ce8; font-weight:700">{ }</text>
+  <text x="128" y="368" class="heading">AI agents</text>
+  <text x="76" y="409" class="small">Direct API · no checkout needed</text>
+
+  <path d="M296 235 H339 V205 H390" class="request"/>
+  <path d="M296 381 H356 V223 H390" class="request"/>
+  <text x="317" y="309" class="label" style="fill:#356ce8" transform="rotate(-90 317 309)">HTTP / JSON</text>
+
+  <text x="390" y="157" class="label" style="fill:#356ce8">COMPUTE</text>
+  <rect x="390" y="180" width="400" height="256" rx="18" fill="#f0f5ff" stroke="#bdd1ff"/>
+  <rect x="410" y="196" width="360" height="44" rx="10" fill="#356ce8"/>
+  <text x="590" y="224" text-anchor="middle" style="font-size:15px; fill:white; font-weight:650">One controller endpoint / load balancer</text>
+  <rect x="410" y="260" width="170" height="111" rx="12" fill="white" stroke="#d4e0fa"/>
+  <rect x="600" y="260" width="170" height="111" rx="12" fill="white" stroke="#d4e0fa"/>
+  <text x="495" y="291" text-anchor="middle" style="font-size:17px; font-weight:650">Controller A</text>
+  <text x="685" y="291" text-anchor="middle" style="font-size:17px; font-weight:650">Controller B</text>
+  <text x="495" y="319" text-anchor="middle" class="small">Same HTTP API</text>
+  <text x="685" y="319" text-anchor="middle" class="small">Same HTTP API</text>
+  <text x="495" y="347" text-anchor="middle" class="mono" style="fill:#356ce8">stateless</text>
+  <text x="685" y="347" text-anchor="middle" class="mono" style="fill:#356ce8">stateless</text>
+  <text x="590" y="407" text-anchor="middle" class="small">Add replicas without copying repository state</text>
+
+  <path d="M790 312 H900" class="wire" style="marker-start:url(#arrow)"/>
+  <text x="844" y="285" text-anchor="middle" class="small">Index</text>
+  <text x="844" y="342" text-anchor="middle" class="small">+ cache</text>
+
+  <text x="900" y="157" class="label" style="fill:#a3680b">COORDINATION</text>
+  <rect x="900" y="180" width="360" height="256" rx="18" fill="#fffaf0" stroke="#efdab2"/>
+  <text x="924" y="217" class="heading">Valkey</text>
+  <text x="924" y="245" class="small">AOF + RDB · volatile-lru</text>
+  <rect x="920" y="266" width="320" height="66" rx="10" fill="white" stroke="#efdab2"/>
+  <text x="936" y="290" style="font-size:14px; font-weight:650">Permanent index · no TTL</text>
+  <text x="936" y="314" class="small">Path / object owners · main ref</text>
+  <rect x="920" y="344" width="320" height="66" rx="10" fill="white" stroke="#efdab2"/>
+  <text x="936" y="368" style="font-size:14px; font-weight:650">Compressed blob cache · TTL</text>
+  <text x="936" y="392" class="small">Evictable without losing routing state</text>
+
+  <path d="M495 436 V530" class="wire"/>
+  <path d="M685 436 V480 H1060 V530" class="wire"/>
+  <text x="516" y="505" class="small">Route immutable deltas and blob requests</text>
+
+  <text x="56" y="553" class="label" style="fill:#0b827b">STORAGE</text>
+  <text x="56" y="586" style="font-size:20px; font-weight:650">Grow by adding shards</text>
+  <text x="56" y="618" class="small">New paths go to the shard</text>
+  <text x="56" y="641" class="small">with the fewest assignments.</text>
+  <text x="56" y="679" class="small" style="font-weight:650; fill:#0b827b">Existing paths stay put.</text>
+
+  <rect x="390" y="530" width="400" height="150" rx="16" class="card"/>
+  <rect x="860" y="530" width="400" height="150" rx="16" class="card"/>
+  <rect x="414" y="554" width="40" height="40" rx="10" fill="#e9f7f5"/>
+  <rect x="884" y="554" width="40" height="40" rx="10" fill="#e9f7f5"/>
+  <text x="434" y="581" text-anchor="middle" style="font-size:19px; font-weight:700; fill:#0b827b">A</text>
+  <text x="904" y="581" text-anchor="middle" style="font-size:19px; font-weight:700; fill:#0b827b">B</text>
+  <text x="470" y="580" class="heading">SQLite shard</text>
+  <text x="940" y="580" class="heading">SQLite shard</text>
+  <text x="414" y="623" class="small">WAL database · file deltas · commit headers</text>
+  <text x="884" y="623" class="small">WAL database · file deltas · commit headers</text>
+  <text x="414" y="653" class="mono" style="fill:#0b827b">independent / unaware of other shards</text>
+  <text x="884" y="653" class="mono" style="fill:#0b827b">independent / unaware of other shards</text>
+
+  <path d="M590 680 V735 H740 V790" class="wire"/>
+  <path d="M1060 680 V735 H910 V790" class="wire"/>
+  <text x="825" y="772" text-anchor="middle" class="label" style="fill:#7956db">DURABLE CONTENT</text>
+
+  <rect x="390" y="790" width="870" height="100" rx="16" fill="#f5f1ff" stroke="#d8cdf3"/>
+  <rect x="414" y="813" width="52" height="50" rx="12" fill="#7956db"/>
+  <text x="440" y="845" text-anchor="middle" style="font-size:18px; font-weight:750; fill:white">S3</text>
+  <text x="488" y="831" class="heading">Shared blob bucket</text>
+  <text x="488" y="862" class="small">Zstandard frames · addressed by SHA-256 of raw contents</text>
+  <text x="390" y="926" class="small">Local disk is also supported: each shard keeps blobs in its own directory.</text>
+</svg>
