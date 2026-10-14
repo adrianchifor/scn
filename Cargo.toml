@@ -11,15 +11,15 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ignore = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-redis = { version = "0.32", default-features = false, features = ["script"] }
-rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls", "fail-on-err"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+redis = { version = "1", default-features = false, features = ["script"] }
+rust-s3 = { version = "0.38", default-features = false, features = ["sync-rustls-tls", "fail-on-err"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-similar = "2"
+sha2 = "0.11"
+similar = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
-zstd = "0.13"
+zstd = "0.14"
 

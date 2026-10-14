@@ -80,7 +80,12 @@ pub struct BlameLine {
 }
 
 pub fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    let mut result = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        result.push(b"0123456789abcdef"[(byte >> 4) as usize] as char);
+        result.push(b"0123456789abcdef"[(byte & 15) as usize] as char);
+    }
+    result
 }
 
 pub fn validate_id(id: &str) -> Result<()> {
