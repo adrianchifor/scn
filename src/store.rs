@@ -1,7 +1,6 @@
 use crate::model::*;
 use crate::storage::{Backend, Blobs, Local};
 use anyhow::{Context, Result, bail, ensure};
-use flate2::read::ZlibDecoder;
 use similar::{ChangeTag, TextDiff};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -48,12 +47,8 @@ impl Store {
     pub fn compressed_blob(&self, id: &str) -> Result<Vec<u8>> {
         validate_id(id)?;
         let bytes = self.backend.blob(id)?;
-        if is_zstd(&bytes) {
-            return Ok(bytes);
-        }
-        let compressed = encode_blob(&decode_blob(&bytes, id)?)?;
-        self.backend.put_blob(id, &compressed, None)?;
-        Ok(compressed)
+        decode_blob(&bytes, id)?;
+        Ok(bytes)
     }
 
     pub fn blob(&self, id: &str) -> Result<Vec<u8>> {
@@ -388,15 +383,9 @@ pub fn encode_blob(bytes: &[u8]) -> Result<Vec<u8>> {
 
 pub fn decode_blob(compressed: &[u8], id: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    if is_zstd(compressed) {
-        zstd::stream::read::Decoder::new(compressed)?
-            .take((MAX_BLOB + 1) as u64)
-            .read_to_end(&mut bytes)?;
-    } else {
-        ZlibDecoder::new(compressed)
-            .take((MAX_BLOB + 1) as u64)
-            .read_to_end(&mut bytes)?;
-    }
+    zstd::stream::read::Decoder::new(compressed)?
+        .take((MAX_BLOB + 1) as u64)
+        .read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() <= MAX_BLOB && hash(&bytes) == id,
         "blob integrity check failed: {id}"

@@ -2,7 +2,7 @@ use crate::{
     model::*,
     server::ApiError,
     storage::Local,
-    store::{MAX_BLOB, decode_blob, encode_blob, is_zstd},
+    store::{MAX_BLOB, decode_blob},
 };
 use anyhow::Result;
 use axum::{
@@ -42,13 +42,8 @@ async fn blob(
 ) -> Result<([(axum::http::HeaderName, &'static str); 2], Vec<u8>), ApiError> {
     let bytes = blocking(local, move |local| {
         let bytes = local.blobs.get(&id)?;
-        let raw = decode_blob(&bytes, &id)?;
-        if is_zstd(&bytes) {
-            return Ok(bytes);
-        }
-        let compressed = encode_blob(&raw)?;
-        local.blobs.put(&id, &compressed)?;
-        Ok(compressed)
+        decode_blob(&bytes, &id)?;
+        Ok(bytes)
     })
     .await?;
     Ok((

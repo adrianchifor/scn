@@ -1,7 +1,4 @@
-use crate::{
-    model::*,
-    store::{decode_blob, encode_blob, is_zstd},
-};
+use crate::{model::*, store::decode_blob};
 use anyhow::{Context, Result, ensure};
 use reqwest::{Client as HttpClient, Response};
 use serde::{Serialize, de::DeserializeOwned};
@@ -131,9 +128,6 @@ impl Client {
         let path = self.cache.join(id);
         if let Ok(compressed) = fs::read(&path) {
             if let Ok(bytes) = decode_blob(&compressed, id) {
-                if !is_zstd(&compressed) {
-                    fs::write(&path, encode_blob(&bytes)?)?;
-                }
                 fs::File::open(&path)?.set_modified(std::time::SystemTime::now())?;
                 return Ok(bytes);
             }
