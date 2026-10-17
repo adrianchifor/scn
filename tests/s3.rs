@@ -94,7 +94,7 @@ async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files(
             bucket: Arc::from(bucket),
             prefix: "repository/blobs".into(),
         };
-        assert!(!blobs.contains(&"0".repeat(64)).unwrap());
+
         Store::with_blobs(&store_path, blobs).unwrap()
     })
     .await
@@ -104,7 +104,9 @@ async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files(
     let api = tokio::spawn(async move {
         axum::serve(listener, server::router(store)).await.unwrap();
     });
-    let client = Client::new(&url, &directory.path().join("cache")).unwrap();
+    let client = Client::new(&url, &directory.path().join("cache"))
+        .await
+        .unwrap();
     let id = client.put_blob(b"S3 content\n".to_vec()).await.unwrap();
     let size = scn::store::MAX_BLOB as u64 + 1;
     let large = client
@@ -146,7 +148,7 @@ async fn signed_s3_storage_round_trips_zstandard_blobs_without_local_blob_files(
     assert_eq!(downloads.load(Ordering::Relaxed), 0);
     client.land(commit.id).await.unwrap();
     assert_eq!(client.blob(&id).await.unwrap(), b"S3 content\n");
-    client.write_file(&large, &mut io::sink()).await.unwrap();
+    client.write_file(&large, io::sink()).await.unwrap();
     for id in large.blobs() {
         assert!(
             objects

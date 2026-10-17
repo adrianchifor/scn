@@ -1,6 +1,7 @@
-use crate::model::*;
 use crate::storage::{Backend, Blobs, Local};
+use crate::{model::*, worker};
 use anyhow::{Context, Result, bail, ensure};
+use axum::body::Bytes;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::{
@@ -83,115 +84,133 @@ impl Store {
         }
     }
 
-    pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
-        self.put_blob_at(bytes, None)
+    pub async fn put_blob(&self, bytes: &[u8]) -> Result<String> {
+        self.put_blob_at(Bytes::copy_from_slice(bytes), None).await
     }
 
-    pub fn put_blob_at(&self, bytes: &[u8], path: Option<&str>) -> Result<String> {
+    pub async fn put_blob_at(&self, bytes: Bytes, path: Option<&str>) -> Result<String> {
         ensure!(bytes.len() <= MAX_BLOB, "blob exceeds 32 MiB limit");
         if let Some(path) = path {
             validate_path(path)?;
         }
-        let id = hash(bytes);
-        self.backend
-            .put_blob(&id, &encode_blob(bytes)?, bytes.len(), path)?;
+        let (id, compressed, size) =
+            worker::cpu(move || Ok((hash(&bytes), Bytes::from(encode_blob(&bytes)?), bytes.len())))
+                .await?;
+        self.backend.put_blob(&id, compressed, size, path).await?;
         Ok(id)
     }
 
-    pub fn compressed_blob(&self, id: &str) -> Result<Vec<u8>> {
+    pub async fn compressed_blob(&self, id: &str) -> Result<Bytes> {
         validate_id(id)?;
-        let bytes = self.backend.blob(id)?;
-        verify_blob(&bytes, id)?;
-        Ok(bytes)
+        let bytes = self.backend.blob(id).await?;
+        let id = id.to_owned();
+        worker::cpu(move || {
+            verify_blob(&bytes, &id)?;
+            Ok(bytes)
+        })
+        .await
     }
 
-    pub fn has_blob(&self, id: &str) -> Result<bool> {
+    pub async fn has_blob(&self, id: &str) -> Result<bool> {
         validate_id(id)?;
-        self.backend.has_blob(id)
+        self.backend.has_blob(id).await
     }
 
-    pub fn blob(&self, id: &str) -> Result<Vec<u8>> {
+    pub async fn blob(&self, id: &str) -> Result<Vec<u8>> {
         validate_id(id)?;
-        decode_blob(&self.backend.blob(id)?, id)
+        let bytes = self.backend.blob(id).await?;
+        let id = id.to_owned();
+        worker::cpu(move || decode_blob(&bytes, &id)).await
     }
 
-    pub fn prepare_file(&self, request: FileRequest) -> Result<FileEntry> {
+    pub async fn prepare_file(&self, request: FileRequest) -> Result<FileEntry> {
         let entry = crate::content::manifest_entry(request.manifest, request.executable)?;
-        self.check_file(&entry, &mut BTreeMap::new())?;
+        self.check_file(&entry, &mut BTreeMap::new()).await?;
         Ok(entry)
     }
 
-    fn check_file<'a>(
+    async fn check_file(
         &self,
-        entry: &'a FileEntry,
-        checked: &mut BTreeMap<&'a str, usize>,
+        entry: &FileEntry,
+        checked: &mut BTreeMap<String, usize>,
     ) -> Result<()> {
         crate::content::validate_entry(entry)?;
+        use futures_util::{StreamExt, TryStreamExt, stream};
+        let missing: BTreeSet<_> = entry
+            .blobs()
+            .filter(|id| !checked.contains_key(*id))
+            .map(str::to_owned)
+            .collect();
+        let backend = self.backend.clone();
+        let sizes: Vec<_> = stream::iter(missing)
+            .map(|id: String| {
+                let backend = backend.clone();
+                async move {
+                    let size = backend
+                        .blob_size(&id)
+                        .await?
+                        .with_context(|| format!("missing blob: {id}"))?;
+                    Ok::<_, anyhow::Error>((id, size))
+                }
+            })
+            .buffer_unordered(16)
+            .try_collect()
+            .await?;
+        checked.extend(sizes);
         if let Some(manifest) = &entry.manifest {
             for (index, id) in manifest.chunks.iter().enumerate() {
-                let length = match checked.get(id.as_str()).copied() {
-                    Some(length) => length,
-                    None => {
-                        let length = self
-                            .backend
-                            .blob_size(id)?
-                            .with_context(|| format!("missing blob: {id}"))?;
-                        checked.insert(id, length);
-                        length
-                    }
-                };
                 let expected = (manifest.size - index as u64 * crate::content::CHUNK_SIZE as u64)
                     .min(crate::content::CHUNK_SIZE as u64);
-                ensure!(length as u64 == expected, "file chunk size mismatch: {id}");
+                ensure!(
+                    checked[id.as_str()] as u64 == expected,
+                    "file chunk size mismatch: {id}"
+                );
             }
-        } else if !checked.contains_key(entry.blob.as_str()) {
-            let size = self
-                .backend
-                .blob_size(&entry.blob)?
-                .with_context(|| format!("missing blob: {}", entry.blob))?;
-            checked.insert(&entry.blob, size);
         }
+
         Ok(())
     }
 
-    pub fn get_commit(&self, id: &str) -> Result<Commit> {
+    pub async fn get_commit(&self, id: &str) -> Result<Commit> {
         validate_id(id)?;
-        self.backend.get_commit(id)
+        self.backend.get_commit(id).await
     }
 
-    pub fn main_ref(&self) -> Result<Option<String>> {
-        self.backend.main_ref()
+    pub async fn main_ref(&self) -> Result<Option<String>> {
+        self.backend.main_ref().await
     }
 
-    pub fn resolve(&self, revision: &str) -> Result<String> {
+    pub async fn resolve(&self, revision: &str) -> Result<String> {
         if revision == "main" {
-            self.main_ref()?
+            self.main_ref()
+                .await?
                 .context("main is empty; commit and land a changeset first")
         } else if let Some(name) = revision.strip_prefix("refs/tags/") {
-            Ok(self.tag(name)?.target)
+            Ok(self.tag(name).await?.target)
         } else if validate_id(revision).is_ok() {
-            Ok(self.get_commit(revision)?.id)
+            Ok(self.get_commit(revision).await?.id)
         } else {
-            Ok(self.tag(revision)?.target)
+            Ok(self.tag(revision).await?.target)
         }
     }
 
-    pub fn tags(&self) -> Result<Vec<Tag>> {
-        let mut tags = self.backend.tags()?;
+    pub async fn tags(&self) -> Result<Vec<Tag>> {
+        let mut tags = self.backend.tags().await?;
         tags.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(tags)
     }
 
-    pub fn tag(&self, name: &str) -> Result<Tag> {
+    pub async fn tag(&self, name: &str) -> Result<Tag> {
         validate_tag_name(name)?;
         self.backend
-            .tag(name)?
+            .tag(name)
+            .await?
             .ok_or_else(|| TagError::NotFound(name.to_owned()).into())
     }
 
-    pub fn create_tag(&self, request: TagRequest) -> Result<Tag> {
+    pub async fn create_tag(&self, request: TagRequest) -> Result<Tag> {
         validate_tag_name(&request.name)?;
-        let target = self.resolve(&request.target)?;
+        let target = self.resolve(&request.target).await?;
         let annotation = request
             .annotation
             .map(|annotation| {
@@ -215,16 +234,16 @@ impl Store {
             annotation,
             git_id: None,
         };
-        self.write_tag(tag, request.force, false)
+        self.write_tag(tag, request.force, false).await
     }
 
-    pub fn import_tag(&self, tag: Tag) -> Result<Tag> {
-        self.write_tag(tag, false, true)
+    pub async fn import_tag(&self, tag: Tag) -> Result<Tag> {
+        self.write_tag(tag, false, true).await
     }
 
-    fn write_tag(&self, tag: Tag, force: bool, imported: bool) -> Result<Tag> {
+    async fn write_tag(&self, tag: Tag, force: bool, imported: bool) -> Result<Tag> {
         validate_tag_name(&tag.name)?;
-        self.parents(&tag.target)?;
+        self.parents(&tag.target).await?;
         if let Some(annotation) = &tag.annotation {
             ensure!(
                 !annotation.tagger.trim().is_empty(),
@@ -234,61 +253,67 @@ impl Store {
         if let Some(id) = &tag.git_id {
             validate_git_id(id)?;
         }
-        if !self.backend.save_tag(&tag, force)?
-            && !(imported && self.backend.tag(&tag.name)?.as_ref() == Some(&tag))
+        if !self.backend.save_tag(&tag, force).await?
+            && !(imported && self.backend.tag(&tag.name).await?.as_ref() == Some(&tag))
         {
             return Err(TagError::Exists(tag.name).into());
         }
         Ok(tag)
     }
 
-    pub fn delete_tag(&self, name: &str) -> Result<()> {
+    pub async fn delete_tag(&self, name: &str) -> Result<()> {
         validate_tag_name(name)?;
         ensure!(
-            self.backend.delete_tag(name)?,
+            self.backend.delete_tag(name).await?,
             TagError::NotFound(name.to_owned())
         );
         Ok(())
     }
 
-    pub fn tree(&self, id: &str) -> Result<Tree> {
+    pub async fn tree(&self, id: &str) -> Result<Tree> {
         let mut chain = Vec::new();
         let mut current = Some(id.to_owned());
         let mut tree = Tree::new();
         while let Some(id) = current {
             let cached = self.trees.lock().unwrap().get(&id);
             if let Some(cached) = cached {
-                tree = (*cached).clone();
+                tree = worker::cpu(move || Ok((*cached).clone())).await?;
                 break;
             }
-            let commit = self.get_commit(&id)?;
+            let commit = self.get_commit(&id).await?;
             current = commit.parents.first().cloned();
             chain.push(commit);
         }
         if chain.is_empty() {
             return Ok(tree);
         }
-        for commit in chain.into_iter().rev() {
-            apply(&mut tree, &commit.changes);
-        }
-        self.trees.lock().unwrap().insert(id, tree.clone());
-        Ok(tree)
+        let trees = self.trees.clone();
+        let id = id.to_owned();
+        worker::cpu(move || {
+            for commit in chain.into_iter().rev() {
+                apply(&mut tree, &commit.changes);
+            }
+            trees.lock().unwrap().insert(&id, tree.clone());
+            Ok(tree)
+        })
+        .await
     }
 
-    pub fn create_commit(&self, request: CommitRequest) -> Result<Commit> {
+    pub async fn create_commit(&self, request: CommitRequest) -> Result<Commit> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_nanos()
             .try_into()?;
-        self.write_commit(request, timestamp, None)
+        self.write_commit(request, timestamp, None).await
     }
 
-    pub fn import_commit(&self, request: ImportCommitRequest) -> Result<Commit> {
+    pub async fn import_commit(&self, request: ImportCommitRequest) -> Result<Commit> {
         validate_git_id(&request.git_id)?;
         self.write_commit(request.commit, request.timestamp, Some(request.git_id))
+            .await
     }
 
-    fn write_commit(
+    async fn write_commit(
         &self,
         request: CommitRequest,
         timestamp: u64,
@@ -312,10 +337,10 @@ impl Store {
             "author must not be empty"
         );
         for parent in request.parents.iter().skip(1) {
-            self.parents(parent)?;
+            self.parents(parent).await?;
         }
         let mut tree = match request.parents.first() {
-            Some(parent) => self.tree(parent)?,
+            Some(parent) => self.tree(parent).await?,
             None => Tree::new(),
         };
         let mut checked_blobs = BTreeMap::new();
@@ -325,7 +350,7 @@ impl Store {
                 if tree.get(path) == Some(entry) {
                     continue;
                 }
-                self.check_file(entry, &mut checked_blobs)?;
+                self.check_file(entry, &mut checked_blobs).await?;
             } else {
                 ensure!(
                     tree.contains_key(path),
@@ -333,65 +358,75 @@ impl Store {
                 );
             }
         }
-        let changes: Changes = request
-            .changes
-            .into_iter()
-            .filter(|(path, entry)| tree.get(path) != entry.as_ref())
-            .collect();
-        apply(&mut tree, &changes);
-        validate_tree(&tree)?;
-        ensure!(
-            imported || !changes.is_empty() || request.parents.len() == 2,
-            "nothing to commit"
-        );
-        let mut commit = Commit {
-            id: String::new(),
-            git_id,
-            parents: request.parents,
-            author: request.author,
-            message: request.message,
-            timestamp,
-            changes,
-        };
-        commit.id = hash(&serde_json::to_vec(&commit)?);
-        self.backend.save_commit(&commit)?;
-        self.trees.lock().unwrap().insert(&commit.id, tree);
+        let (commit, tree) = worker::cpu(move || {
+            let changes: Changes = request
+                .changes
+                .into_iter()
+                .filter(|(path, entry)| tree.get(path) != entry.as_ref())
+                .collect();
+            apply(&mut tree, &changes);
+            validate_tree(&tree)?;
+            ensure!(
+                imported || !changes.is_empty() || request.parents.len() == 2,
+                "nothing to commit"
+            );
+            let mut commit = Commit {
+                id: String::new(),
+                git_id,
+                parents: request.parents,
+                author: request.author,
+                message: request.message,
+                timestamp,
+                changes,
+            };
+            commit.id = hash(&serde_json::to_vec(&commit)?);
+            Ok((commit, tree))
+        })
+        .await?;
+        self.backend.save_commit(&commit).await?;
+        let trees = self.trees.clone();
+        let id = commit.id.clone();
+        worker::cpu(move || {
+            trees.lock().unwrap().insert(&id, tree);
+            Ok(())
+        })
+        .await?;
         Ok(commit)
     }
 
-    pub fn update_main(&self, update: RefUpdate) -> Result<()> {
-        self.get_commit(&update.target)?;
+    pub async fn update_main(&self, update: RefUpdate) -> Result<()> {
+        self.get_commit(&update.target).await?;
         if let Some(expected) = &update.expected {
             ensure!(
-                self.is_ancestor(expected, &update.target)?,
+                self.is_ancestor(expected, &update.target).await?,
                 "main updates must be fast-forward; merge or rebase first"
             );
         }
-        self.backend.update_main(update)
+        self.backend.update_main(update).await
     }
 
-    fn parents(&self, id: &str) -> Result<Vec<String>> {
+    async fn parents(&self, id: &str) -> Result<Vec<String>> {
         validate_id(id)?;
-        self.backend.parents(id)
+        self.backend.parents(id).await
     }
 
-    fn ancestors(&self, head: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    async fn ancestors(&self, head: &str) -> Result<BTreeMap<String, Vec<String>>> {
         let mut result = BTreeMap::new();
         let mut queue = VecDeque::from([head.to_owned()]);
         while let Some(id) = queue.pop_front() {
             if result.contains_key(&id) {
                 continue;
             }
-            let parents = self.parents(&id)?;
+            let parents = self.parents(&id).await?;
             queue.extend(parents.iter().cloned());
             result.insert(id, parents);
         }
         Ok(result)
     }
 
-    pub fn is_ancestor(&self, ancestor: &str, head: &str) -> Result<bool> {
+    pub async fn is_ancestor(&self, ancestor: &str, head: &str) -> Result<bool> {
         validate_id(ancestor)?;
-        let parents = self.parents(head)?;
+        let parents = self.parents(head).await?;
         if head == ancestor {
             return Ok(true);
         }
@@ -402,15 +437,15 @@ impl Store {
                 return Ok(true);
             }
             if seen.insert(id.clone()) {
-                queue.extend(self.parents(&id)?);
+                queue.extend(self.parents(&id).await?);
             }
         }
         Ok(false)
     }
 
-    pub fn merge_base(&self, left: &str, right: &str) -> Result<String> {
-        let left = self.ancestors(left)?;
-        let right = self.ancestors(right)?;
+    pub async fn merge_base(&self, left: &str, right: &str) -> Result<String> {
+        let left = self.ancestors(left).await?;
+        let right = self.ancestors(right).await?;
         let common: BTreeSet<_> = left
             .keys()
             .filter(|id| right.contains_key(*id))
@@ -431,7 +466,7 @@ impl Store {
             .context("changesets have no common ancestor")
     }
 
-    pub fn log(&self, head: &str, limit: usize, path: Option<&str>) -> Result<Vec<Commit>> {
+    pub async fn log(&self, head: &str, limit: usize, path: Option<&str>) -> Result<Vec<Commit>> {
         if let Some(path) = path {
             validate_path(path)?;
         }
@@ -441,7 +476,7 @@ impl Store {
             if commits.len() >= limit {
                 break;
             }
-            let commit = self.get_commit(&id)?;
+            let commit = self.get_commit(&id).await?;
             current = commit.parents.first().cloned();
             if path.is_none_or(|path| commit.changes.contains_key(path)) {
                 commits.push(commit);
@@ -450,73 +485,75 @@ impl Store {
         Ok(commits)
     }
 
-    pub fn diff(&self, from: &str, to: &str) -> Result<Vec<DiffEntry>> {
-        let before = self.tree(from)?;
-        let after = self.tree(to)?;
-        changes_between(&before, &after)
-            .into_iter()
-            .map(|(path, entry)| {
-                let old = before.get(&path).cloned();
-                if old.as_ref().is_some_and(|entry| entry.manifest.is_some())
-                    || entry.as_ref().is_some_and(|entry| entry.manifest.is_some())
-                {
-                    return Ok(DiffEntry {
-                        path,
-                        before: old,
-                        after: entry,
-                        patch: None,
-                    });
-                }
-                let old_bytes = old
-                    .as_ref()
-                    .map(|entry| self.blob(&entry.blob))
-                    .transpose()?
-                    .unwrap_or_default();
-                let new_bytes = entry
-                    .as_ref()
-                    .map(|entry| self.blob(&entry.blob))
-                    .transpose()?
-                    .unwrap_or_default();
-                Ok(DiffEntry {
-                    patch: patch(&path, &old_bytes, &new_bytes),
-                    path,
-                    before: old,
-                    after: entry,
-                })
-            })
-            .collect()
+    pub async fn diff(&self, from: &str, to: &str) -> Result<Vec<DiffEntry>> {
+        let before = self.tree(from).await?;
+        let after = self.tree(to).await?;
+        let mut result = Vec::new();
+        for (path, entry) in changes_between(&before, &after) {
+            let old = before.get(&path).cloned();
+            let patch = if old.as_ref().is_some_and(|e| e.manifest.is_some())
+                || entry.as_ref().is_some_and(|e| e.manifest.is_some())
+            {
+                None
+            } else {
+                let old_bytes = match &old {
+                    Some(e) => self.blob(&e.blob).await?,
+                    None => Vec::new(),
+                };
+                let new_bytes = match &entry {
+                    Some(e) => self.blob(&e.blob).await?,
+                    None => Vec::new(),
+                };
+                let path = path.clone();
+                worker::cpu(move || Ok(patch(&path, &old_bytes, &new_bytes))).await?
+            };
+            result.push(DiffEntry {
+                path,
+                before: old,
+                after: entry,
+                patch,
+            });
+        }
+        Ok(result)
     }
 
-    pub fn merge(&self, head: &str, other: &str, author: &str) -> Result<Commit> {
-        if self.is_ancestor(other, head)? {
-            return self.get_commit(head);
+    pub async fn merge(&self, head: &str, other: &str, author: &str) -> Result<Commit> {
+        if self.is_ancestor(other, head).await? {
+            return self.get_commit(head).await;
         }
-        if self.is_ancestor(head, other)? {
-            return self.get_commit(other);
+        if self.is_ancestor(head, other).await? {
+            return self.get_commit(other).await;
         }
-        let base = self.merge_base(head, other)?;
-        let ours = self.tree(head)?;
-        let merged = merge_trees(&self.tree(&base)?, &ours, &self.tree(other)?)?;
+        let base = self.merge_base(head, other).await?;
+        let ours = self.tree(head).await?;
+        let base_tree = self.tree(&base).await?;
+        let theirs = self.tree(other).await?;
+        let changes = worker::cpu(move || {
+            let merged = merge_trees(&base_tree, &ours, &theirs)?;
+            Ok(changes_between(&ours, &merged))
+        })
+        .await?;
         self.create_commit(CommitRequest {
             parents: vec![head.to_owned(), other.to_owned()],
             author: author.to_owned(),
             message: format!("Merge {} into {}", &other[..12], &head[..12]),
-            changes: changes_between(&ours, &merged),
+            changes,
         })
+        .await
     }
 
-    pub fn rebase(&self, head: &str, onto: &str, author: &str) -> Result<Commit> {
-        if self.is_ancestor(head, onto)? {
-            return self.get_commit(onto);
+    pub async fn rebase(&self, head: &str, onto: &str, author: &str) -> Result<Commit> {
+        if self.is_ancestor(head, onto).await? {
+            return self.get_commit(onto).await;
         }
-        if self.is_ancestor(onto, head)? {
-            return self.get_commit(head);
+        if self.is_ancestor(onto, head).await? {
+            return self.get_commit(head).await;
         }
-        let base = self.merge_base(head, onto)?;
+        let base = self.merge_base(head, onto).await?;
         let mut chain = Vec::new();
         let mut current = head.to_owned();
         while current != base {
-            let commit = self.get_commit(&current)?;
+            let commit = self.get_commit(&current).await?;
             ensure!(
                 commit.parents.len() == 1,
                 "rebase requires a linear first-parent history; use merge"
@@ -524,30 +561,33 @@ impl Store {
             current = commit.parents[0].clone();
             chain.push(commit);
         }
-        let mut target = self.get_commit(onto)?;
+        let mut target = self.get_commit(onto).await?;
         for original in chain.into_iter().rev() {
-            let before = self.tree(&target.id)?;
-            let merged = merge_trees(
-                &self.tree(&original.parents[0])?,
-                &before,
-                &self.tree(&original.id)?,
-            )?;
-            let changes = changes_between(&before, &merged);
+            let before = self.tree(&target.id).await?;
+            let base_tree = self.tree(&original.parents[0]).await?;
+            let after = self.tree(&original.id).await?;
+            let changes = worker::cpu(move || {
+                let merged = merge_trees(&base_tree, &before, &after)?;
+                Ok(changes_between(&before, &merged))
+            })
+            .await?;
             if !changes.is_empty() {
-                target = self.create_commit(CommitRequest {
-                    parents: vec![target.id],
-                    author: author.to_owned(),
-                    message: original.message,
-                    changes,
-                })?;
+                target = self
+                    .create_commit(CommitRequest {
+                        parents: vec![target.id],
+                        author: author.to_owned(),
+                        message: original.message,
+                        changes,
+                    })
+                    .await?;
             }
         }
         Ok(target)
     }
 
-    pub fn blame(&self, head: &str, path: &str) -> Result<Vec<BlameLine>> {
+    pub async fn blame(&self, head: &str, path: &str) -> Result<Vec<BlameLine>> {
         validate_path(path)?;
-        let tree = self.tree(head)?;
+        let tree = self.tree(head).await?;
         let entry = tree
             .get(path)
             .with_context(|| format!("path not found: {path}"))?;
@@ -555,7 +595,7 @@ impl Store {
             entry.manifest.is_none(),
             "blame is unavailable for files over 32 MiB"
         );
-        let mut history = self.log(head, usize::MAX, Some(path))?;
+        let mut history = self.log(head, usize::MAX, Some(path)).await?;
         history.reverse();
         let mut text = String::new();
         let mut lines: Vec<BlameLine> = Vec::new();
@@ -566,27 +606,30 @@ impl Store {
                     .is_none_or(|entry| entry.manifest.is_none()),
                 "blame is unavailable for files over 32 MiB"
             );
-            let bytes = commit.changes[path]
-                .as_ref()
-                .map(|entry| self.blob(&entry.blob))
-                .transpose()?
-                .unwrap_or_default();
-            let next = String::from_utf8(bytes).context("blame requires UTF-8 text")?;
-            ensure!(!next.contains('\0'), "blame requires text");
-            let mut updated = Vec::new();
-            for change in TextDiff::from_lines(&text, &next).iter_all_changes() {
-                match change.tag() {
-                    ChangeTag::Equal => updated.push(lines[change.old_index().unwrap()].clone()),
-                    ChangeTag::Insert => updated.push(BlameLine {
-                        commit: commit.id.clone(),
-                        author: commit.author.clone(),
-                        line: change.value().to_owned(),
-                    }),
-                    ChangeTag::Delete => {}
+            let bytes = match &commit.changes[path] {
+                Some(entry) => self.blob(&entry.blob).await?,
+                None => Vec::new(),
+            };
+            (text, lines) = worker::cpu(move || {
+                let next = String::from_utf8(bytes).context("blame requires UTF-8 text")?;
+                ensure!(!next.contains('\0'), "blame requires text");
+                let mut updated = Vec::new();
+                for change in TextDiff::from_lines(&text, &next).iter_all_changes() {
+                    match change.tag() {
+                        ChangeTag::Equal => {
+                            updated.push(lines[change.old_index().unwrap()].clone())
+                        }
+                        ChangeTag::Insert => updated.push(BlameLine {
+                            commit: commit.id.clone(),
+                            author: commit.author.clone(),
+                            line: change.value().to_owned(),
+                        }),
+                        ChangeTag::Delete => {}
+                    }
                 }
-            }
-            text = next;
-            lines = updated;
+                Ok((next, updated))
+            })
+            .await?;
         }
         Ok(lines)
     }

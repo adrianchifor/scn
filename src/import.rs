@@ -1,4 +1,4 @@
-use crate::{client::Client, model::*, store::MAX_BLOB};
+use crate::{client::Client, model::*, store::MAX_BLOB, worker};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::HashMap,
@@ -28,7 +28,7 @@ fn run(repository: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 struct Objects {
-    child: Child,
+    child: Option<Child>,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
 }
@@ -43,7 +43,7 @@ impl Objects {
         let input = child.stdin.take().unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
         Ok(Self {
-            child,
+            child: Some(child),
             input,
             output,
         })
@@ -82,19 +82,49 @@ impl Objects {
         Ok(bytes)
     }
 
-    async fn upload_blob(&mut self, client: &Client, id: &str, path: &str) -> Result<FileEntry> {
-        let size = self.header(id, "blob")?;
-        let reader = std::io::Read::by_ref(&mut self.output).take(size);
-        let entry = client.put_file(reader, size, false, Some(path)).await?;
-        self.newline()?;
-        Ok(entry)
+    async fn upload_blob(
+        mut self,
+        client: &Client,
+        id: &str,
+        path: &str,
+    ) -> Result<(Self, FileEntry)> {
+        let id = id.to_owned();
+        let (objects, size) = worker::io(move || {
+            let size = self.header(&id, "blob")?;
+            Ok((self, size))
+        })
+        .await?;
+        let (reader, entry) = client
+            .put_reader(objects.take(size), size, false, Some(path))
+            .await?;
+        let mut objects = reader.into_inner();
+        worker::io(move || {
+            objects.newline()?;
+            Ok((objects, entry))
+        })
+        .await
+    }
+}
+
+impl Read for Objects {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.output.read(buffer)
     }
 }
 
 impl Drop for Objects {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                });
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }
 
@@ -224,30 +254,45 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
         client.main_ref().await?.is_none(),
         "Git import requires an empty main ref"
     );
-    ensure!(
-        run(repository, &["rev-parse", "--is-shallow-repository"])? == b"false\n",
-        "shallow Git repositories are unsupported; fetch the full history first"
-    );
-    let revision = String::from_utf8(run(
-        repository,
-        &[
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{revision}^{{commit}}"),
-        ],
-    )?)?
-    .trim()
-    .to_owned();
-    let mut objects = Objects::open(repository)?;
-    let tags = git_tags(repository, &mut objects)?;
-    let history = git_history(repository, &revision, &tags)?;
+    let repository = repository.to_owned();
+    let requested = revision.to_owned();
+    let directory = repository.clone();
+    let (mut objects, revision, tags, history) = worker::io(move || {
+        let repository = directory;
+        let revision = requested;
+        ensure!(
+            run(&repository, &["rev-parse", "--is-shallow-repository"])? == b"false\n",
+            "shallow Git repositories are unsupported; fetch the full history first"
+        );
+        let revision = String::from_utf8(run(
+            &repository,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{revision}^{{commit}}"),
+            ],
+        )?)?
+        .trim()
+        .to_owned();
+        let mut objects = Objects::open(&repository)?;
+        let tags = git_tags(&repository, &mut objects)?;
+        let history = git_history(&repository, &revision, &tags)?;
+        Ok((objects, revision, tags, history))
+    })
+    .await?;
     let mut commits = HashMap::<String, String>::new();
     let mut blobs = HashMap::<String, FileEntry>::new();
     let mut tip = None;
     for id in history.lines() {
-        let original = parse_commit(&objects.read(id, "commit")?)
-            .with_context(|| format!("cannot import Git commit {id}"))?;
+        let owned = id.to_owned();
+        let (next, original) = worker::io(move || {
+            let original = parse_commit(&objects.read(&owned, "commit")?)
+                .with_context(|| format!("cannot import Git commit {owned}"))?;
+            Ok((objects, original))
+        })
+        .await?;
+        objects = next;
         let mut args = vec![
             "diff-tree",
             "--root",
@@ -262,7 +307,15 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
             args.push(parent);
         }
         args.extend([id, "--"]);
-        let diff = run(repository, &args)?;
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        let directory = repository.clone();
+        let diff = worker::io(move || {
+            run(
+                &directory,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+        })
+        .await?;
         let mut records = diff.split(|byte| *byte == 0);
         let mut changes = Changes::new();
         while let Some(header) = records.next().filter(|header| !header.is_empty()) {
@@ -278,7 +331,8 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
                     let mut entry = match blobs.get(git_blob) {
                         Some(entry) => entry.clone(),
                         None => {
-                            let entry = objects.upload_blob(client, git_blob, path).await?;
+                            let (next, entry) = objects.upload_blob(client, git_blob, path).await?;
+                            objects = next;
                             blobs.insert(git_blob.to_owned(), entry.clone());
                             entry
                         }

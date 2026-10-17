@@ -129,10 +129,7 @@ async fn start_shard(root: &Path) -> Running {
 
 async fn controller(cache: &str, shards: Vec<String>, ttl: u64) -> Running {
     let cache = cache.to_owned();
-    let cluster =
-        tokio::task::spawn_blocking(move || Cluster::open(&cache, "test", &shards, ttl).unwrap())
-            .await
-            .unwrap();
+    let cluster = Cluster::open(&cache, "test", &shards, ttl).await.unwrap();
     start(server::router(Store::with_backend(Arc::new(cluster)))).await
 }
 
@@ -160,13 +157,15 @@ async fn controllers_share_shards_and_concurrent_main_updates_are_atomic() {
     for n in 0..6 {
         fs::write(work.root.join(format!("file{n}")), format!("initial {n}\n")).unwrap();
     }
-    let client = work.client().unwrap();
+    let client = work.client().await.unwrap();
     let root = work
         .commit(&client, "root".into(), "author".into())
         .await
         .unwrap();
     client.land(root.id.clone()).await.unwrap();
-    let other = Client::new(&second.url, &directory.path().join("cache")).unwrap();
+    let other = Client::new(&second.url, &directory.path().join("cache"))
+        .await
+        .unwrap();
     let tag = TagRequest {
         name: "release/v1".into(),
         target: root.id.clone(),
@@ -276,7 +275,7 @@ async fn new_shards_take_new_paths_without_rebalancing_and_index_survives_restar
     let mut work = Workspace::clone(&first.url, &directory.path().join("work"), "main", vec![])
         .await
         .unwrap();
-    let client = work.client().unwrap();
+    let client = work.client().await.unwrap();
     for n in 0..8 {
         fs::write(work.root.join(format!("file{n}")), format!("file {n}")).unwrap();
     }
@@ -326,14 +325,18 @@ async fn new_shards_take_new_paths_without_rebalancing_and_index_survives_restar
         .await
         .unwrap();
     let third = controller(&cache.url, vec![], 60).await;
-    let other = Client::new(&third.url, &directory.path().join("cache")).unwrap();
+    let other = Client::new(&third.url, &directory.path().join("cache"))
+        .await
+        .unwrap();
     assert_eq!(other.main_ref().await.unwrap(), Some(next.id.clone()));
     assert_eq!(other.tag("persisted").await.unwrap(), tag);
     assert_eq!(other.commit("persisted").await.unwrap().id, next.id);
     assert_eq!(other.tree(&next.id, &[]).await.unwrap(), work.state.files);
     assert!(cache.directory.path().join("dump.rdb").exists());
     assert!(cache.directory.path().join("appendonlydir").exists());
-    let peer = Client::new(&second.url, &directory.path().join("peer-cache")).unwrap();
+    let peer = Client::new(&second.url, &directory.path().join("peer-cache"))
+        .await
+        .unwrap();
     let (left, right) = tokio::join!(
         client.put_blob_at(b"same path left".to_vec(), Some("concurrent")),
         peer.put_blob_at(b"same path right".to_vec(), Some("concurrent"))
@@ -366,7 +369,9 @@ async fn compressed_blob_cache_is_shared_and_ttl_does_not_expire_the_index() {
     let shard = start_shard(&directory.path().join("shard")).await;
     let first = controller(&cache.url, vec![shard.url.clone()], 3).await;
     let second = controller(&cache.url, vec![], 3).await;
-    let client = Client::new(&first.url, &directory.path().join("cache")).unwrap();
+    let client = Client::new(&first.url, &directory.path().join("cache"))
+        .await
+        .unwrap();
     let id = client
         .put_blob_at(b"cached\n".to_vec(), Some("file"))
         .await
@@ -481,7 +486,9 @@ async fn large_file_chunks_span_shards_and_survive_controller_restart() {
     let first = start_shard(&directory.path().join("first")).await;
     let second = start_shard(&directory.path().join("second")).await;
     let api = controller(&cache.url, vec![first.url.clone(), second.url.clone()], 60).await;
-    let client = Client::new(&api.url, &directory.path().join("cache")).unwrap();
+    let client = Client::new(&api.url, &directory.path().join("cache"))
+        .await
+        .unwrap();
     let chunk = scn::content::CHUNK_SIZE as u64;
     let source = io::repeat(1)
         .take(chunk)
@@ -517,13 +524,12 @@ async fn large_file_chunks_span_shards_and_survive_controller_restart() {
         .await
         .unwrap();
     let restarted = controller(&cache.url, vec![], 60).await;
-    let other = Client::new(&restarted.url, &directory.path().join("other-cache")).unwrap();
-    let tree = other.tree(&commit.id, &[]).await.unwrap();
-    assert_eq!(tree["large"], entry);
-    other
-        .write_file(&tree["large"], &mut io::sink())
+    let other = Client::new(&restarted.url, &directory.path().join("other-cache"))
         .await
         .unwrap();
+    let tree = other.tree(&commit.id, &[]).await.unwrap();
+    assert_eq!(tree["large"], entry);
+    other.write_file(&tree["large"], io::sink()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -587,13 +593,13 @@ async fn concurrent_gibibyte_files_round_trip_across_controllers_and_shards() {
         };
         let cache = directory.path().join(format!("client-{index}"));
         async move {
-            let client = Client::new(endpoint, &cache)?;
-            let mut source = Source {
+            let client = Client::new(endpoint, &cache).await?;
+            let source = Source {
                 remaining: size,
                 state: index + 1,
                 digest: Sha256::new(),
             };
-            let entry = client.put_file(&mut source, size, false, None).await?;
+            let (source, entry) = client.put_reader(source, size, false, None).await?;
             assert_eq!(entry.manifest.as_ref().unwrap().chunks.len(), 128);
             let prepared: FileEntry = client
                 .post(
@@ -621,7 +627,7 @@ async fn concurrent_gibibyte_files_round_trip_across_controllers_and_shards() {
                 entry
             );
             let mut output = Sink::default();
-            client.write_file(&entry, &mut output).await?;
+            output = client.write_file(&entry, output).await?;
             assert_eq!(output.written, size);
             assert_eq!(output.digest.finalize(), source.digest.finalize());
             Ok::<_, anyhow::Error>(())
@@ -632,4 +638,104 @@ async fn concurrent_gibibyte_files_round_trip_across_controllers_and_shards() {
         "Four concurrent 1 GiB uploads, manifests, commits, and verified downloads in {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+#[ignore = "requires valkey-server; set SCN_VALKEY_SERVER and run with --ignored"]
+fn shard_and_valkey_requests_progress_with_the_blocking_pool_saturated() {
+    use scn::storage::Backend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cache = Valkey::start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let concurrent = active.clone();
+        let peak = maximum.clone();
+        let id = "0".repeat(64);
+        let header = StoredCommit {
+            commit: Commit {
+                id: id.clone(),
+                parents: vec![],
+                author: "test".into(),
+                message: "test".into(),
+                timestamp: 0,
+                changes: Changes::new(),
+                git_id: None,
+            },
+            paths: vec![],
+        };
+        let header = serde_json::to_value(header).unwrap();
+        let shard = start(
+            axum::Router::new()
+                .route("/health", axum::routing::get(|| async { "ok" }))
+                .route(
+                    "/internal/commits/{id}",
+                    axum::routing::get(move || {
+                        let header = header.clone();
+                        let concurrent = concurrent.clone();
+                        let peak = peak.clone();
+                        async move {
+                            let count = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(count, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            concurrent.fetch_sub(1, Ordering::SeqCst);
+                            axum::Json(header)
+                        }
+                    }),
+                ),
+        )
+        .await;
+        let cluster = Cluster::open(&cache.url, "async", std::slice::from_ref(&shard.url), 60)
+            .await
+            .unwrap();
+        let mut connection = redis::Client::open(cache.url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        redis::AsyncCommands::hset::<_, _, _, ()>(
+            &mut connection,
+            "scn:{async}:commits",
+            &id,
+            &shard.url,
+        )
+        .await
+        .unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            ready.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        started.await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::try_join_all((0..32).map(|index| {
+                let cluster = &cluster;
+                let id = &id;
+                async move {
+                    let tag = Tag {
+                        name: format!("v{index}"),
+                        target: id.clone(),
+                        annotation: None,
+                        git_id: None,
+                    };
+                    assert!(cluster.save_tag(&tag, false).await?);
+                    assert_eq!(cluster.tag(&tag.name).await?, Some(tag));
+                    assert!(cluster.parents(id).await?.is_empty());
+                    Ok::<_, anyhow::Error>(())
+                }
+            })),
+        )
+        .await;
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        result.unwrap().unwrap();
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+    });
 }

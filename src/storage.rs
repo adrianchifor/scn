@@ -1,5 +1,7 @@
-use crate::model::*;
+use crate::{model::*, worker};
 use anyhow::{Context, Result, ensure};
+use async_trait::async_trait;
+use axum::body::Bytes;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use s3::{Bucket, Region, creds::Credentials};
 use std::{
@@ -10,27 +12,33 @@ use std::{
     time::Duration,
 };
 
+#[async_trait]
 pub trait Backend: Send + Sync {
-    fn put_blob(&self, id: &str, bytes: &[u8], size: usize, path: Option<&str>) -> Result<()>;
-    fn blob(&self, id: &str) -> Result<Vec<u8>>;
-    fn has_blob(&self, id: &str) -> Result<bool>;
-    fn blob_size(&self, id: &str) -> Result<Option<usize>> {
-        if !self.has_blob(id)? {
+    async fn put_blob(&self, id: &str, bytes: Bytes, size: usize, path: Option<&str>)
+    -> Result<()>;
+    async fn blob(&self, id: &str) -> Result<Bytes>;
+    async fn has_blob(&self, id: &str) -> Result<bool>;
+    async fn blob_size(&self, id: &str) -> Result<Option<usize>> {
+        if !self.has_blob(id).await? {
             return Ok(None);
         }
-        Ok(Some(crate::store::verify_blob(&self.blob(id)?, id)?))
+        Ok(Some({
+            let bytes = self.blob(id).await?;
+            let id = id.to_owned();
+            worker::cpu(move || crate::store::verify_blob(&bytes, &id)).await?
+        }))
     }
-    fn get_commit(&self, id: &str) -> Result<Commit>;
-    fn parents(&self, id: &str) -> Result<Vec<String>> {
-        Ok(self.get_commit(id)?.parents)
+    async fn get_commit(&self, id: &str) -> Result<Commit>;
+    async fn parents(&self, id: &str) -> Result<Vec<String>> {
+        Ok(self.get_commit(id).await?.parents)
     }
-    fn save_commit(&self, commit: &Commit) -> Result<()>;
-    fn main_ref(&self) -> Result<Option<String>>;
-    fn update_main(&self, update: RefUpdate) -> Result<()>;
-    fn tags(&self) -> Result<Vec<Tag>>;
-    fn tag(&self, name: &str) -> Result<Option<Tag>>;
-    fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool>;
-    fn delete_tag(&self, name: &str) -> Result<bool>;
+    async fn save_commit(&self, commit: &Commit) -> Result<()>;
+    async fn main_ref(&self) -> Result<Option<String>>;
+    async fn update_main(&self, update: RefUpdate) -> Result<()>;
+    async fn tags(&self) -> Result<Vec<Tag>>;
+    async fn tag(&self, name: &str) -> Result<Option<Tag>>;
+    async fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool>;
+    async fn delete_tag(&self, name: &str) -> Result<bool>;
 }
 
 #[derive(Clone)]
@@ -72,40 +80,54 @@ impl Blobs {
         }
     }
 
-    pub fn put(&self, id: &str, bytes: &[u8]) -> Result<()> {
+    pub async fn put(&self, id: &str, bytes: Bytes) -> Result<()> {
         validate_id(id)?;
         match self {
             Self::Disk(directory) => {
-                let mut temp = tempfile::NamedTempFile::new_in(directory)?;
-                temp.write_all(bytes)?;
-                temp.as_file().sync_all()?;
-                temp.persist(directory.join(id))?;
-                fs::File::open(directory)?.sync_all()?;
+                let directory = directory.clone();
+                let id = id.to_owned();
+                worker::io(move || {
+                    let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
+                    temp.write_all(&bytes)?;
+                    temp.as_file().sync_all()?;
+                    temp.persist(directory.join(id))?;
+                    fs::File::open(directory)?.sync_all()?;
+                    Ok(())
+                })
+                .await?;
             }
             Self::S3 { bucket, prefix } => {
-                bucket.put_object_with_content_type(
-                    Self::key(prefix, id),
-                    bytes,
-                    "application/zstd",
-                )?;
+                bucket
+                    .put_object_with_content_type(Self::key(prefix, id), &bytes, "application/zstd")
+                    .await?;
             }
         }
         Ok(())
     }
 
-    pub fn get(&self, id: &str) -> Result<Vec<u8>> {
+    pub async fn get(&self, id: &str) -> Result<Bytes> {
         validate_id(id)?;
         match self {
-            Self::Disk(directory) => fs::read(directory.join(id)).context("blob not found"),
-            Self::S3 { bucket, prefix } => Ok(bucket.get_object(Self::key(prefix, id))?.to_vec()),
+            Self::Disk(directory) => {
+                let path = directory.join(id);
+                worker::io(move || fs::read(path).map(Bytes::from).context("blob not found")).await
+            }
+            Self::S3 { bucket, prefix } => Ok(bucket
+                .get_object(Self::key(prefix, id))
+                .await?
+                .bytes()
+                .clone()),
         }
     }
 
-    pub fn contains(&self, id: &str) -> Result<bool> {
+    pub async fn contains(&self, id: &str) -> Result<bool> {
         validate_id(id)?;
         match self {
-            Self::Disk(directory) => Ok(directory.join(id).is_file()),
-            Self::S3 { bucket, prefix } => Ok(bucket.object_exists(Self::key(prefix, id))?),
+            Self::Disk(directory) => {
+                let path = directory.join(id);
+                worker::io(move || Ok(path.is_file())).await
+            }
+            Self::S3 { bucket, prefix } => Ok(bucket.object_exists(Self::key(prefix, id)).await?),
         }
     }
 }
@@ -226,38 +248,8 @@ impl Local {
     }
 }
 
-impl Backend for Local {
-    fn put_blob(&self, id: &str, bytes: &[u8], size: usize, _: Option<&str>) -> Result<()> {
-        self.blobs.put(id, bytes)?;
-        self.record_blob(id, size)
-    }
-    fn blob(&self, id: &str) -> Result<Vec<u8>> {
-        self.blobs.get(id)
-    }
-    fn has_blob(&self, id: &str) -> Result<bool> {
-        self.blobs.contains(id)
-    }
-
-    fn blob_size(&self, id: &str) -> Result<Option<usize>> {
-        if !self.blobs.contains(id)? {
-            return Ok(None);
-        }
-        let size: Option<u32> = self
-            .connection()?
-            .query_row("SELECT size FROM blobs WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        if let Some(size) = size {
-            ensure!(size as usize <= crate::store::MAX_BLOB, "invalid blob size");
-            return Ok(Some(size as usize));
-        }
-        let size = crate::store::verify_blob(&self.blobs.get(id)?, id)?;
-        self.record_blob(id, size)?;
-        Ok(Some(size))
-    }
-
-    fn get_commit(&self, id: &str) -> Result<Commit> {
+impl Local {
+    fn get_commit_db(&self, id: &str) -> Result<Commit> {
         let data: String = self
             .connection()?
             .query_row("SELECT data FROM commits WHERE id = ?1", [id], |row| {
@@ -267,7 +259,7 @@ impl Backend for Local {
         Ok(serde_json::from_str(&data)?)
     }
 
-    fn parents(&self, id: &str) -> Result<Vec<String>> {
+    fn parents_db(&self, id: &str) -> Result<Vec<String>> {
         let data: String = self
             .connection()?
             .query_row(
@@ -279,7 +271,7 @@ impl Backend for Local {
         Ok(serde_json::from_str(&data)?)
     }
 
-    fn save_commit(&self, commit: &Commit) -> Result<()> {
+    fn save_commit_db(&self, commit: &Commit) -> Result<()> {
         self.connection()?.execute(
             "INSERT OR IGNORE INTO commits (id, data) VALUES (?1, ?2)",
             params![commit.id, serde_json::to_string(commit)?],
@@ -287,7 +279,7 @@ impl Backend for Local {
         Ok(())
     }
 
-    fn main_ref(&self) -> Result<Option<String>> {
+    fn main_ref_db(&self) -> Result<Option<String>> {
         Ok(self
             .connection()?
             .query_row("SELECT target FROM refs WHERE name = 'main'", [], |row| {
@@ -296,14 +288,14 @@ impl Backend for Local {
             .optional()?)
     }
 
-    fn tags(&self) -> Result<Vec<Tag>> {
+    fn tags_db(&self) -> Result<Vec<Tag>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT data FROM tags ORDER BY name")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
-    fn tag(&self, name: &str) -> Result<Option<Tag>> {
+    fn tag_db(&self, name: &str) -> Result<Option<Tag>> {
         let data: Option<String> = self
             .connection()?
             .query_row("SELECT data FROM tags WHERE name = ?1", [name], |row| {
@@ -314,7 +306,7 @@ impl Backend for Local {
             .transpose()
     }
 
-    fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool> {
+    fn save_tag_db(&self, tag: &Tag, force: bool) -> Result<bool> {
         let sql = if force {
             "INSERT INTO tags (name, data) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET data = excluded.data"
         } else {
@@ -326,14 +318,14 @@ impl Backend for Local {
             > 0)
     }
 
-    fn delete_tag(&self, name: &str) -> Result<bool> {
+    fn delete_tag_db(&self, name: &str) -> Result<bool> {
         Ok(self
             .connection()?
             .execute("DELETE FROM tags WHERE name = ?1", [name])?
             > 0)
     }
 
-    fn update_main(&self, update: RefUpdate) -> Result<()> {
+    fn update_main_db(&self, update: RefUpdate) -> Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actual: Option<String> = transaction
@@ -345,5 +337,97 @@ impl Backend for Local {
         transaction.execute("INSERT INTO refs (name, target) VALUES ('main', ?1) ON CONFLICT(name) DO UPDATE SET target = excluded.target", [&update.target])?;
         transaction.commit()?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Backend for Local {
+    async fn put_blob(&self, id: &str, bytes: Bytes, size: usize, _: Option<&str>) -> Result<()> {
+        self.blobs.put(id, bytes).await?;
+        let local = self.clone();
+        let id = id.to_owned();
+        worker::io(move || local.record_blob(&id, size)).await
+    }
+
+    async fn blob(&self, id: &str) -> Result<Bytes> {
+        self.blobs.get(id).await
+    }
+
+    async fn has_blob(&self, id: &str) -> Result<bool> {
+        self.blobs.contains(id).await
+    }
+
+    async fn blob_size(&self, id: &str) -> Result<Option<usize>> {
+        if !self.blobs.contains(id).await? {
+            return Ok(None);
+        }
+        let local = self.clone();
+        let owned = id.to_owned();
+        let size = worker::io(move || {
+            let size: Option<u32> = local
+                .connection()?
+                .query_row("SELECT size FROM blobs WHERE id = ?1", [owned], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            Ok(size)
+        })
+        .await?;
+        if let Some(size) = size {
+            ensure!(size as usize <= crate::store::MAX_BLOB, "invalid blob size");
+            return Ok(Some(size as usize));
+        }
+        let bytes = self.blobs.get(id).await?;
+        let owned = id.to_owned();
+        let size = worker::cpu(move || crate::store::verify_blob(&bytes, &owned)).await?;
+        let local = self.clone();
+        let id = id.to_owned();
+        worker::io(move || local.record_blob(&id, size)).await?;
+        Ok(Some(size))
+    }
+    async fn get_commit(&self, id: &str) -> Result<Commit> {
+        let local = self.clone();
+        let id = id.to_owned();
+        worker::io(move || local.get_commit_db(&id)).await
+    }
+    async fn parents(&self, id: &str) -> Result<Vec<String>> {
+        let local = self.clone();
+        let id = id.to_owned();
+        worker::io(move || local.parents_db(&id)).await
+    }
+    async fn save_commit(&self, commit: &Commit) -> Result<()> {
+        let local = self.clone();
+        let commit = commit.clone();
+        worker::io(move || local.save_commit_db(&commit)).await
+    }
+    async fn main_ref(&self) -> Result<Option<String>> {
+        let local = self.clone();
+
+        worker::io(move || local.main_ref_db()).await
+    }
+    async fn update_main(&self, update: RefUpdate) -> Result<()> {
+        let local = self.clone();
+
+        worker::io(move || local.update_main_db(update)).await
+    }
+    async fn tags(&self) -> Result<Vec<Tag>> {
+        let local = self.clone();
+
+        worker::io(move || local.tags_db()).await
+    }
+    async fn tag(&self, name: &str) -> Result<Option<Tag>> {
+        let local = self.clone();
+        let name = name.to_owned();
+        worker::io(move || local.tag_db(&name)).await
+    }
+    async fn save_tag(&self, tag: &Tag, force: bool) -> Result<bool> {
+        let local = self.clone();
+        let tag = tag.clone();
+        worker::io(move || local.save_tag_db(&tag, force)).await
+    }
+    async fn delete_tag(&self, name: &str) -> Result<bool> {
+        let local = self.clone();
+        let name = name.to_owned();
+        worker::io(move || local.delete_tag_db(&name)).await
     }
 }

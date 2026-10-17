@@ -7,15 +7,16 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 globset = "0.4"
 ignore = "0.4"
 percent-encoding = "2"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
-redis = { version = "1", default-features = false, features = ["script"] }
-rust-s3 = { version = "0.38", default-features = false, features = ["sync-rustls-tls", "fail-on-err"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+redis = { version = "1", default-features = false, features = ["script", "tokio-comp", "connection-manager"] }
+rust-s3 = { version = "0.38", default-features = false, features = ["tokio-rustls-tls", "fail-on-err"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

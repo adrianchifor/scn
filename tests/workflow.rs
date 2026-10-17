@@ -69,7 +69,7 @@ async fn checkout_downloads_unique_changed_blobs_with_bounded_concurrency() {
     let metrics = Arc::new(BlobMetrics::default());
     let server = Server::with_blob_metrics(Some(metrics.clone())).await;
     let root = server.directory.path();
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     let mut changes = Changes::new();
     for n in 0..16 {
         let blob = client
@@ -135,7 +135,7 @@ async fn checkout_downloads_unique_changed_blobs_with_bounded_concurrency() {
         fs::remove_file(entry.unwrap().path()).unwrap();
     }
     metrics.requests.store(0, Ordering::SeqCst);
-    let work_client = work.client().unwrap();
+    let work_client = work.client().await.unwrap();
     work.checkout(&work_client, &first.id, None).await.unwrap();
     assert_eq!(metrics.requests.load(Ordering::SeqCst), 0);
     let blob = client.put_blob(b"updated".to_vec()).await.unwrap();
@@ -199,7 +199,7 @@ async fn blob_cache_evicts_old_entries_after_crossing_its_size_limit() {
         file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(n + 1))
             .unwrap();
     }
-    let client = Client::new(&server.url, &cache).unwrap();
+    let client = Client::new(&server.url, &cache).await.unwrap();
     let id = client.put_blob(b"contents".to_vec()).await.unwrap();
     assert_eq!(client.blob(&id).await.unwrap(), b"contents");
     let size: u64 = fs::read_dir(&cache)
@@ -322,7 +322,7 @@ async fn git_import_preserves_history_merges_metadata_and_committed_contents() {
         .filter(|(left, _)| *left != "main")
         .collect();
     assert_eq!(mapping.len(), 5);
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     for (original_id, imported_id) in &mapping {
         let original =
             String::from_utf8(git(&source, &["cat-file", "commit", original_id])).unwrap();
@@ -382,7 +382,7 @@ async fn git_import_supports_bare_repositories_and_empty_histories() {
     );
     git(root, &["clone", "--bare", "source", "bare"]);
     scn(root, &["import-git", "bare", &server.url]);
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     let main = client.commit("main").await.unwrap();
     assert!(main.parents.is_empty());
     assert!(main.message.is_empty());
@@ -411,7 +411,7 @@ async fn failed_git_import_keeps_main_empty_and_can_be_retried() {
         &["update-index", "--add", "--cacheinfo", &cacheinfo],
     );
     git(&source, &["commit", "-m", "Add submodule"]);
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     for _ in 0..2 {
         let failed = run(root, &["import-git", "source", &server.url]);
         assert!(!failed.status.success());
@@ -444,7 +444,7 @@ async fn git_import_keeps_distinct_commits_with_identical_author_and_file_metada
     git(&source, &["checkout", "main"]);
     git(&source, &["merge", "--no-ff", "side", "-m", "Merge"]);
     scn(root, &["import-git", "source", &server.url]);
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     let tip = client.commit("main").await.unwrap();
     assert_eq!(tip.parents.len(), 2);
     let left = client.commit(&tip.parents[0]).await.unwrap();
@@ -512,7 +512,7 @@ async fn sparse_commits_preserve_omitted_files_and_rebase_onto_main() {
     let mut full = Workspace::clone(&server.url, &root.join("full"), "main", vec![])
         .await
         .unwrap();
-    let client = full.client().unwrap();
+    let client = full.client().await.unwrap();
     fs::create_dir(full.root.join("src")).unwrap();
     fs::create_dir(full.root.join("docs")).unwrap();
     fs::write(full.root.join("src/main.rs"), "before").unwrap();
@@ -541,7 +541,11 @@ async fn sparse_commits_preserve_omitted_files_and_rebase_onto_main() {
     );
     fs::write(sparse.root.join("src/main.rs"), "local").unwrap();
     let local = sparse
-        .commit(&sparse.client().unwrap(), "local".into(), "agent".into())
+        .commit(
+            &sparse.client().await.unwrap(),
+            "local".into(),
+            "agent".into(),
+        )
         .await
         .unwrap();
     let tree = client.tree(&local.id, &[]).await.unwrap();
@@ -581,7 +585,7 @@ async fn checkout_handles_file_directory_transitions_and_protects_ignored_files(
     let mut work = Workspace::clone(&server.url, &root.join("work"), "main", vec![])
         .await
         .unwrap();
-    let client = work.client().unwrap();
+    let client = work.client().await.unwrap();
     fs::write(work.root.join("a"), "file").unwrap();
     fs::write(work.root.join(".scnignore"), "ignored\n").unwrap();
     let first = work
@@ -637,7 +641,7 @@ async fn symlinks_are_rejected_and_executable_bits_round_trip() {
     let mut work = Workspace::clone(&server.url, &root.join("work"), "main", vec![])
         .await
         .unwrap();
-    let client = work.client().unwrap();
+    let client = work.client().await.unwrap();
     fs::write(work.root.join("script"), "run").unwrap();
     fs::set_permissions(work.root.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
     let first = work
@@ -669,7 +673,7 @@ async fn symlinks_are_rejected_and_executable_bits_round_trip() {
 async fn client_recovers_from_corrupt_cached_blobs() {
     let server = Server::start().await;
     let cache = server.directory.path().join("cache");
-    let client = Client::new(&server.url, &cache).unwrap();
+    let client = Client::new(&server.url, &cache).await.unwrap();
     let id = client.put_blob(b"content".to_vec()).await.unwrap();
     fs::write(cache.join(&id), "corrupt").unwrap();
     assert_eq!(client.blob(&id).await.unwrap(), b"content");
@@ -797,7 +801,7 @@ async fn git_style_tags_work_in_cli_api_and_revision_routes() {
     scn(&work, &["tag", "v1"]);
     let name = "releases/α+β#%";
     scn(&work, &["tag", "-a", name, "-m", "First release"]);
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     let first = client.commit("v1").await.unwrap();
     let tag = client.tag(name).await.unwrap();
     assert_eq!(tag.target, first.id);
@@ -919,7 +923,7 @@ async fn git_import_preserves_all_commit_tags_annotations_and_detached_histories
             "refs/heads/main",
         ],
     );
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     let main = client.commit("main").await.unwrap();
     assert_eq!(main.message, "Main\n");
     assert_eq!(
@@ -990,7 +994,7 @@ async fn git_import_rejects_non_commit_tags_before_publishing_refs() {
     let output = run(root, &["import-git", "source", &server.url]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must point to a commit"));
-    let client = Client::new(&server.url, &root.join("cache")).unwrap();
+    let client = Client::new(&server.url, &root.join("cache")).await.unwrap();
     assert!(client.main_ref().await.unwrap().is_none());
     assert!(client.tags().await.unwrap().is_empty());
 }

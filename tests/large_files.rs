@@ -135,7 +135,9 @@ fn file_chunking_has_canonical_boundaries_and_detects_size_changes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_oversized_blobs_and_validates_chunk_manifests() {
     let server = Server::start().await;
-    let client = Client::new(&server.url, &server.directory.path().join("cache")).unwrap();
+    let client = Client::new(&server.url, &server.directory.path().join("cache"))
+        .await
+        .unwrap();
     let response = reqwest::Client::new()
         .post(format!("{}/v1/blobs", server.url))
         .body(vec![0; MAX_BLOB + 1])
@@ -181,7 +183,7 @@ async fn api_rejects_oversized_blobs_and_validates_chunk_manifests() {
         .unwrap();
     assert_eq!(client.tree(&commit.id, &[]).await.unwrap()["large"], entry);
     let mut sink = Sink::default();
-    client.write_file(&entry, &mut sink).await.unwrap();
+    sink = client.write_file(&entry, sink).await.unwrap();
     assert_eq!(sink.size, size);
     assert_eq!(sink.last, Some(7));
     let modified = io::repeat(7).take(size - 1).chain(&b"\x08"[..]);
@@ -261,9 +263,9 @@ async fn large_files_stage_snapshot_checkout_show_and_import_without_whole_file_
     let workspace = Workspace::find(&work).unwrap();
     let first = workspace.state.revision.clone().unwrap();
     let entry = workspace.state.files["large"].clone();
-    let client = workspace.client().unwrap();
+    let client = workspace.client().await.unwrap();
     let mut sink = Sink::default();
-    client.write_file(&entry, &mut sink).await.unwrap();
+    sink = client.write_file(&entry, sink).await.unwrap();
     assert_eq!((sink.size, sink.last), (size, Some(7)));
     fs::write(&file, "small").unwrap();
     cli(&work, &["commit", "-am", "shrink"]);
@@ -338,7 +340,9 @@ async fn large_files_stage_snapshot_checkout_show_and_import_without_whole_file_
 #[ignore = "streams 5 GiB; run with --release --ignored"]
 async fn five_gibibyte_files_stream_with_bounded_buffers() {
     let server = Server::start().await;
-    let client = Client::new(&server.url, &server.directory.path().join("cache")).unwrap();
+    let client = Client::new(&server.url, &server.directory.path().join("cache"))
+        .await
+        .unwrap();
     let size = 5 * 1024 * 1024 * 1024u64;
     let entry = client
         .put_file(io::repeat(0).take(size), size, false, None)
@@ -351,7 +355,7 @@ async fn five_gibibyte_files_stream_with_bounded_buffers() {
         .unwrap();
     assert_eq!(client.tree(&commit.id, &[]).await.unwrap()["large"], entry);
     let mut sink = Sink::default();
-    client.write_file(&entry, &mut sink).await.unwrap();
+    sink = client.write_file(&entry, sink).await.unwrap();
     assert_eq!(sink.size, size);
     assert_eq!(sink.max_write, CHUNK_SIZE);
     assert_eq!(

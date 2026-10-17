@@ -38,7 +38,11 @@ impl<R: Read> FileReader<R> {
         Ok(Some((id, bytes)))
     }
 
-    pub fn finish(mut self, executable: bool) -> Result<FileEntry> {
+    pub fn finish(self, executable: bool) -> Result<FileEntry> {
+        Ok(self.finish_with_reader(executable)?.1)
+    }
+
+    pub fn finish_with_reader(mut self, executable: bool) -> Result<(R, FileEntry)> {
         ensure!(
             self.remaining == 0 && !self.chunks.is_empty(),
             "file was not fully read"
@@ -48,19 +52,23 @@ impl<R: Read> FileReader<R> {
             "file changed while reading; retry"
         );
         if self.size > MAX_BLOB as u64 {
-            return manifest_entry(
+            let entry = manifest_entry(
                 FileManifest {
                     size: self.size,
                     chunks: self.chunks,
                 },
                 executable,
-            );
+            )?;
+            return Ok((self.reader, entry));
         }
-        Ok(FileEntry {
-            blob: self.chunks.remove(0),
-            executable,
-            manifest: None,
-        })
+        Ok((
+            self.reader,
+            FileEntry {
+                blob: self.chunks.remove(0),
+                executable,
+                manifest: None,
+            },
+        ))
     }
 }
 

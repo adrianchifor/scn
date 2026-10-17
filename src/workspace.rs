@@ -3,6 +3,7 @@ use crate::{
     content::read_entry,
     model::*,
     store::{decode_blob, encode_blob},
+    worker,
 };
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -26,6 +27,7 @@ pub struct WorkspaceState {
     pub remote_main: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Workspace {
     pub root: PathBuf,
     pub state: WorkspaceState,
@@ -33,13 +35,48 @@ pub struct Workspace {
 
 pub struct WorkspaceLock(PathBuf);
 
+impl WorkspaceLock {
+    pub async fn release(mut self) -> Result<()> {
+        let path = std::mem::take(&mut self.0);
+        worker::io(move || {
+            fs::remove_file(path)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if self.0.as_os_str().is_empty() {
+            return;
+        }
+        let path = self.0.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let _ = fs::remove_file(path);
+            });
+        } else {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
 impl Workspace {
+    pub async fn on_disk<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(&mut Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let mut workspace = self.clone();
+        let (workspace, result) = worker::io(move || {
+            let result = work(&mut workspace);
+            Ok((workspace, result))
+        })
+        .await?;
+        *self = workspace;
+        result
+    }
+
     pub fn find(start: &Path) -> Result<Self> {
         for root in start.ancestors() {
             let metadata = root.join(".scn");
@@ -72,27 +109,37 @@ impl Workspace {
         for prefix in &sparse {
             validate_path(prefix)?;
         }
-        fs::create_dir_all(destination)?;
-        ensure!(
-            fs::read_dir(destination)?.next().is_none(),
-            "clone destination must be empty"
-        );
-        let root = destination.canonicalize()?;
-        fs::create_dir(root.join(".scn"))?;
-        let mut workspace = Self {
-            root,
-            state: WorkspaceState {
-                server: url.trim_end_matches('/').to_owned(),
-                revision: None,
-                sparse: vec![],
-                files: Tree::new(),
-                index: Changes::new(),
-                remote_main: None,
-            },
-        };
-        let _lock = workspace.lock()?;
-        workspace.save()?;
-        let client = workspace.client()?;
+        let destination = destination.to_owned();
+        let url = url.trim_end_matches('/').to_owned();
+        let mut workspace = worker::io(move || {
+            fs::create_dir_all(&destination)?;
+            ensure!(
+                fs::read_dir(&destination)?.next().is_none(),
+                "clone destination must be empty"
+            );
+            let root = destination.canonicalize()?;
+            fs::create_dir(root.join(".scn"))?;
+            Ok(Self {
+                root,
+                state: WorkspaceState {
+                    server: url,
+                    revision: None,
+                    sparse: vec![],
+                    files: Tree::new(),
+                    index: Changes::new(),
+                    remote_main: None,
+                },
+            })
+        })
+        .await?;
+        let _lock = workspace
+            .on_disk(|w| {
+                let lock = w.lock()?;
+                w.save()?;
+                Ok(lock)
+            })
+            .await?;
+        let client = workspace.client().await?;
         let target = if revision == "main" {
             client.main_ref().await?
         } else {
@@ -100,6 +147,7 @@ impl Workspace {
         };
         workspace.state.remote_main = client.main_ref().await?;
         workspace.materialize(&client, target, sparse).await?;
+        _lock.release().await?;
         Ok(workspace)
     }
 
@@ -113,8 +161,8 @@ impl Workspace {
         Ok(WorkspaceLock(path))
     }
 
-    pub fn client(&self) -> Result<Client> {
-        Client::new(&self.state.server, &self.root.join(".scn/cache"))
+    pub async fn client(&self) -> Result<Client> {
+        Client::new(&self.state.server, &self.root.join(".scn/cache")).await
     }
 
     pub fn save(&self) -> Result<()> {
@@ -268,7 +316,8 @@ impl Workspace {
         message: String,
         author: String,
     ) -> Result<Commit> {
-        self.stage(&[".".into()], &self.root.clone(), false)?;
+        self.on_disk(|w| w.stage(&[".".into()], &w.root.clone(), false))
+            .await?;
         self.commit_staged(client, message, author).await
     }
 
@@ -396,27 +445,37 @@ impl Workspace {
         let files = self.staged_tree();
         let changes = self.state.index.clone();
         ensure!(!changes.is_empty(), "nothing to commit; use scn add first");
-        let mut uploaded = std::collections::BTreeSet::new();
+        let mut uploads = std::collections::BTreeMap::new();
         for (path, entry) in &changes {
             if let Some(entry) = entry {
                 for id in entry.blobs() {
-                    if uploaded.insert(id)
-                        && (entry.manifest.is_none() || !client.has_blob(id).await?)
-                    {
-                        client
-                            .put_blob_at(
-                                self.staged_blob(id)?,
-                                if entry.manifest.is_some() {
-                                    None
-                                } else {
-                                    Some(path)
-                                },
-                            )
-                            .await?;
-                    }
+                    uploads.entry(id.to_owned()).or_insert_with(|| {
+                        if entry.manifest.is_some() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        }
+                    });
                 }
             }
         }
+        let directory = self.root.join(".scn/staged");
+        stream::iter(uploads)
+            .map(|(id, path): (String, Option<String>)| {
+                let directory = directory.clone();
+                async move {
+                    if path.is_some() || !client.has_blob(&id).await? {
+                        let file = directory.join(&id);
+                        let compressed = worker::io(move || Ok(fs::read(file)?)).await?;
+                        let bytes = worker::cpu(move || decode_blob(&compressed, &id)).await?;
+                        client.put_blob_at(bytes, path.as_deref()).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+            })
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await?;
         let commit: Commit = client
             .post(
                 "/v1/commits",
@@ -431,8 +490,8 @@ impl Workspace {
         self.state.revision = Some(commit.id.clone());
         self.state.files = files;
         self.state.index.clear();
-        self.save()?;
-        self.prune_staged()?;
+        self.on_disk(|w| w.save()).await?;
+        self.on_disk(|w| w.prune_staged()).await?;
         Ok(commit)
     }
 
@@ -442,7 +501,7 @@ impl Workspace {
         revision: &str,
         sparse: Option<Vec<String>>,
     ) -> Result<()> {
-        self.ensure_clean()?;
+        self.on_disk(|w| w.ensure_clean()).await?;
         let target = client.commit(&self.revision(revision)?).await?.id;
         self.materialize(
             client,
@@ -455,7 +514,7 @@ impl Workspace {
     pub async fn fetch(&mut self, client: &Client) -> Result<Option<String>> {
         let target = client.main_ref().await?;
         self.state.remote_main = target.clone();
-        self.save()?;
+        self.on_disk(|w| w.save()).await?;
         Ok(target)
     }
 
@@ -466,7 +525,7 @@ impl Workspace {
         ff_only: bool,
         author: String,
     ) -> Result<()> {
-        self.ensure_clean()?;
+        self.on_disk(|w| w.ensure_clean()).await?;
         let Some(target) = self.fetch(client).await? else {
             return Ok(());
         };
@@ -505,7 +564,7 @@ impl Workspace {
         revision: Option<String>,
         sparse: Vec<String>,
     ) -> Result<()> {
-        self.ensure_clean()?;
+        self.on_disk(|w| w.ensure_clean()).await?;
         for prefix in &sparse {
             validate_path(prefix)?;
         }
@@ -516,10 +575,21 @@ impl Workspace {
         };
         validate_tree(&tree)?;
         let changes = changes_between(&self.state.files, &tree);
-        for path in changes.keys().filter(|path| tree.contains_key(*path)) {
-            self.check_target(path)?;
-        }
-        let stage = tempfile::tempdir_in(self.root.join(".scn"))?;
+        let targets: Vec<_> = changes
+            .keys()
+            .filter(|path| tree.contains_key(*path))
+            .cloned()
+            .collect();
+        let directory = self.root.join(".scn");
+        self.on_disk(move |w| {
+            for path in targets {
+                w.check_target(&path)?;
+            }
+            Ok(())
+        })
+        .await?;
+        let stage =
+            worker::Cleanup::new(worker::io(move || Ok(tempfile::tempdir_in(directory)?)).await?);
         let mut downloads = std::collections::BTreeMap::<_, Vec<_>>::new();
         for (path, entry) in &changes {
             if let Some(entry) = entry {
@@ -534,54 +604,69 @@ impl Workspace {
                 let stage = stage.path();
                 async move {
                     let first = stage.join(paths[0].0);
-                    fs::create_dir_all(first.parent().unwrap())?;
-                    let mut file = fs::File::create(&first)?;
-                    client.write_file(paths[0].1, &mut file).await?;
-                    file.flush()?;
-                    for (path, entry) in paths {
-                        let staged = stage.join(path);
-                        fs::create_dir_all(staged.parent().unwrap())?;
-                        if staged != first {
-                            fs::copy(&first, &staged)?;
+                    let destination = first.clone();
+                    let file = worker::io(move || {
+                        fs::create_dir_all(destination.parent().unwrap())?;
+                        Ok(fs::File::create(destination)?)
+                    })
+                    .await?;
+                    let mut file = client.write_file(paths[0].1, file).await?;
+                    let paths: Vec<_> = paths
+                        .into_iter()
+                        .map(|(p, e)| (stage.join(p), e.executable))
+                        .collect();
+                    worker::io(move || {
+                        file.flush()?;
+                        for (staged, executable) in paths {
+                            fs::create_dir_all(staged.parent().unwrap())?;
+                            if staged != first {
+                                fs::copy(&first, &staged)?;
+                            }
+                            set_executable(&staged, executable)?;
                         }
-                        set_executable(&staged, entry.executable)?;
-                    }
+                        Ok(())
+                    })
+                    .await?;
                     Ok::<_, anyhow::Error>(())
                 }
             })
             .buffer_unordered(8)
             .try_collect::<Vec<_>>()
             .await?;
-        self.ensure_clean()?;
-        for path in changes.keys().filter(|path| tree.contains_key(*path)) {
-            self.check_target(path)?;
-        }
-        for path in changes
-            .keys()
-            .filter(|path| self.state.files.contains_key(*path))
-        {
-            let full = self.path(path)?;
-            fs::remove_file(&full)?;
-            let mut parent = full.parent();
-            while let Some(directory) = parent {
-                if directory == self.root || fs::remove_dir(directory).is_err() {
-                    break;
+        self.on_disk(move |w| {
+            w.ensure_clean()?;
+            for path in changes.keys().filter(|path| tree.contains_key(*path)) {
+                w.check_target(path)?;
+            }
+            for path in changes
+                .keys()
+                .filter(|path| w.state.files.contains_key(*path))
+            {
+                let full = w.path(path)?;
+                fs::remove_file(&full)?;
+                let mut parent = full.parent();
+                while let Some(directory) = parent {
+                    if directory == w.root || fs::remove_dir(directory).is_err() {
+                        break;
+                    }
+                    parent = directory.parent();
                 }
-                parent = directory.parent();
             }
-        }
-        for path in changes.keys().filter(|path| tree.contains_key(*path)) {
-            let full = self.path(path)?;
-            if full.is_dir() {
-                fs::remove_dir_all(&full)?;
+            for path in changes.keys().filter(|path| tree.contains_key(*path)) {
+                let full = w.path(path)?;
+                if full.is_dir() {
+                    fs::remove_dir_all(&full)?;
+                }
+                fs::create_dir_all(full.parent().unwrap())?;
+                fs::rename(stage.path().join(path), &full)?;
             }
-            fs::create_dir_all(full.parent().unwrap())?;
-            fs::rename(stage.path().join(path), &full)?;
-        }
-        self.state.revision = revision;
-        self.state.sparse = sparse;
-        self.state.files = tree;
-        self.save()?;
+            w.state.revision = revision;
+            w.state.sparse = sparse;
+            w.state.files = tree;
+            w.save()?;
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 

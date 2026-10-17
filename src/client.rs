@@ -2,6 +2,7 @@ use crate::{
     content::{CHUNK_SIZE, FileReader, validate_entry},
     model::*,
     store::{MAX_BLOB, decode_blob},
+    worker,
 };
 use anyhow::{Context, Result, ensure};
 use reqwest::{Client as HttpClient, Response};
@@ -10,21 +11,22 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
 const CACHE_LIMIT: u64 = 64 * 1024 * 1024;
 
+#[derive(Clone)]
 pub struct Client {
     pub url: String,
     http: HttpClient,
     cache: PathBuf,
-    cache_size: Mutex<Option<u64>>,
+    cache_size: Arc<Mutex<Option<u64>>>,
 }
 
 impl Client {
-    pub fn new(url: &str, cache: &Path) -> Result<Self> {
+    pub async fn new(url: &str, cache: &Path) -> Result<Self> {
         let parsed = reqwest::Url::parse(url).context("invalid server URL")?;
         ensure!(
             matches!(parsed.scheme(), "http" | "https")
@@ -33,14 +35,19 @@ impl Client {
                 && parsed.fragment().is_none(),
             "expected an http(s) server URL"
         );
-        fs::create_dir_all(cache)?;
+        let directory = cache.to_owned();
+        worker::io(move || {
+            fs::create_dir_all(directory)?;
+            Ok(())
+        })
+        .await?;
         Ok(Self {
             url: url.trim_end_matches('/').to_owned(),
             http: HttpClient::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
             cache: cache.to_owned(),
-            cache_size: Mutex::new(None),
+            cache_size: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -124,24 +131,62 @@ impl Client {
         self.put_blob_at(bytes, None).await
     }
 
-    pub async fn put_file(
+    pub async fn put_file<R: Read + Send + 'static>(
         &self,
-        reader: impl Read,
+        reader: R,
         size: u64,
         executable: bool,
         path: Option<&str>,
     ) -> Result<FileEntry> {
-        let mut reader = FileReader::new(reader, size);
-        let mut uploaded = std::collections::BTreeSet::new();
-        while let Some((id, bytes)) = reader.next_blob()? {
-            if uploaded.insert(id.clone())
-                && (size <= MAX_BLOB as u64 || !self.has_blob(&id).await?)
-            {
+        Ok(self.put_reader(reader, size, executable, path).await?.1)
+    }
+
+    pub async fn put_reader<R: Read + Send + 'static>(
+        &self,
+        reader: R,
+        size: u64,
+        executable: bool,
+        path: Option<&str>,
+    ) -> Result<(R, FileEntry)> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let producer = tokio::spawn(async move {
+            let mut reader = FileReader::new(reader, size);
+            let mut uploaded = std::collections::BTreeSet::new();
+            loop {
+                let (next, blob) = worker::io(move || {
+                    let blob = reader.next_blob()?;
+                    Ok((reader, blob))
+                })
+                .await?;
+                reader = next;
+                let Some((id, bytes)) = blob else {
+                    break;
+                };
+                if uploaded.insert(id.clone()) {
+                    sender.send((id, bytes)).await?;
+                }
+            }
+            worker::io(move || reader.finish_with_reader(executable)).await
+        });
+        use futures_util::{StreamExt, TryStreamExt, stream};
+        let uploads = stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|item| (item, receiver))
+        })
+        .map(|(id, bytes)| async move {
+            if size <= MAX_BLOB as u64 || !self.has_blob(&id).await? {
                 self.put_blob_at(bytes, if size > MAX_BLOB as u64 { None } else { path })
                     .await?;
             }
+            Ok::<_, anyhow::Error>(())
+        })
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await;
+        if let Err(error) = uploads {
+            producer.abort();
+            return Err(error);
         }
-        reader.finish(executable)
+        producer.await?
     }
 
     pub async fn has_blob(&self, id: &str) -> Result<bool> {
@@ -156,26 +201,40 @@ impl Client {
         Ok(true)
     }
 
-    pub async fn write_file(&self, entry: &FileEntry, output: &mut impl Write) -> Result<()> {
+    pub async fn write_file<W: Write + Send + 'static>(
+        &self,
+        entry: &FileEntry,
+        mut output: W,
+    ) -> Result<W> {
         validate_entry(entry)?;
         let mut written = 0;
-        for id in entry.blobs() {
-            let bytes = self.blob(id).await?;
+        use futures_util::{StreamExt, stream};
+        let mut downloads = stream::iter(entry.blobs())
+            .map(|id| self.blob(id))
+            .buffered(4);
+        while let Some(bytes) = downloads.next().await {
+            let bytes = bytes?;
             if let Some(manifest) = &entry.manifest {
                 let expected = (manifest.size - written).min(CHUNK_SIZE as u64);
-                ensure!(
-                    bytes.len() as u64 == expected,
-                    "file chunk size mismatch: {id}"
-                );
+                ensure!(bytes.len() as u64 == expected, "file chunk size mismatch");
             }
-            output.write_all(&bytes)?;
-            written += bytes.len() as u64;
+            let length = bytes.len() as u64;
+            output = worker::io(move || {
+                output.write_all(&bytes)?;
+                Ok(output)
+            })
+            .await?;
+            written += length;
         }
-        Ok(())
+        Ok(output)
     }
 
     pub async fn put_blob_at(&self, bytes: Vec<u8>, path: Option<&str>) -> Result<String> {
-        let expected = hash(&bytes);
+        let (bytes, expected) = worker::cpu(move || {
+            let expected = hash(&bytes);
+            Ok((bytes, expected))
+        })
+        .await?;
         let mut request = self.http.post(format!("{}/v1/blobs", self.url));
         if let Some(path) = path {
             request = request.query(&[("path", path)]);
@@ -194,39 +253,54 @@ impl Client {
     pub async fn blob(&self, id: &str) -> Result<Vec<u8>> {
         validate_id(id)?;
         let path = self.cache.join(id);
-        if let Ok(compressed) = fs::read(&path) {
-            if let Ok(bytes) = decode_blob(&compressed, id) {
-                if let Ok(file) = fs::File::open(&path) {
-                    let _ = file.set_modified(std::time::SystemTime::now());
-                }
+        let cached = path.clone();
+        if let Some(compressed) = worker::io(move || Ok(fs::read(cached).ok())).await? {
+            let owned = id.to_owned();
+            if let Ok(bytes) = worker::cpu(move || decode_blob(&compressed, &owned)).await {
+                worker::io(move || {
+                    if let Ok(file) = fs::File::open(path) {
+                        let _ = file.set_modified(SystemTime::now());
+                    }
+                    Ok(())
+                })
+                .await?;
                 return Ok(bytes);
-            }
-            let mut size = self.cache_size.lock().unwrap();
-            if let Ok(metadata) = fs::metadata(&path) {
-                fs::remove_file(&path)?;
-                if let Some(size) = size.as_mut() {
-                    *size = size.saturating_sub(metadata.len());
-                }
             }
         }
         let response = self
             .send(self.http.get(format!("{}/v1/blobs/{id}", self.url)))
             .await?;
         let compressed = Self::response(response).await?.bytes().await?;
-        let bytes = decode_blob(&compressed, id)?;
-        let mut temp = tempfile::NamedTempFile::new_in(&self.cache)?;
-        temp.write_all(&compressed)?;
-        let mut size = self.cache_size.lock().unwrap();
-        if size.is_none() {
-            *size = Some(self.cache_entries()?.iter().map(|(_, size, _)| size).sum());
-        }
-        let size = size.as_mut().unwrap();
-        let previous = fs::metadata(&path).map_or(0, |metadata| metadata.len());
-        temp.persist(&path)?;
-        *size = size.saturating_sub(previous) + compressed.len() as u64;
-        if *size > CACHE_LIMIT {
-            *size = self.trim_cache()?;
-        }
+        let owned = id.to_owned();
+        let (compressed, bytes) = worker::cpu(move || {
+            let bytes = decode_blob(&compressed, &owned)?;
+            Ok((compressed, bytes))
+        })
+        .await?;
+        let client = self.clone();
+        worker::io(move || {
+            let mut temp = tempfile::NamedTempFile::new_in(&client.cache)?;
+            temp.write_all(&compressed)?;
+            let mut size = client.cache_size.lock().unwrap();
+            if size.is_none() {
+                *size = Some(
+                    client
+                        .cache_entries()?
+                        .iter()
+                        .map(|(_, size, _)| size)
+                        .sum(),
+                );
+            }
+            let size = size.as_mut().unwrap();
+            let previous = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            temp.persist(&path)?;
+            *size = size.saturating_sub(previous) + compressed.len() as u64;
+            if *size > CACHE_LIMIT {
+                *size = client.trim_cache()?;
+            }
+            Ok(())
+        })
+        .await?;
         Ok(bytes)
     }
 

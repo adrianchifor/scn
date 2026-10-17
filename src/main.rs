@@ -363,10 +363,8 @@ async fn main() -> Result<()> {
                 listen,
                 limits,
             }) => {
-                let backend = tokio::task::spawn_blocking(move || {
-                    scn::cluster::Cluster::open(&cache, &namespace, &shard, blob_ttl)
-                })
-                .await??;
+                let backend =
+                    scn::cluster::Cluster::open(&cache, &namespace, &shard, blob_ttl).await?;
                 return server::serve_router(
                     server::router_with_limits(Store::with_backend(Arc::new(backend)), limits),
                     &listen,
@@ -390,8 +388,9 @@ async fn main() -> Result<()> {
             url,
             rev,
         } => {
-            let cache = tempfile::tempdir()?;
-            let client = scn::client::Client::new(&url, cache.path())?;
+            let cache =
+                scn::worker::Cleanup::new(scn::worker::io(|| Ok(tempfile::tempdir()?)).await?);
+            let client = scn::client::Client::new(&url, cache.path()).await?;
             let commit = scn::import::import_git(&client, &repository, &rev).await?;
             println!("main -> {}", commit.id);
             return Ok(());
@@ -420,270 +419,305 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    let mut workspace = Workspace::find(&std::env::current_dir()?)?;
-    let _lock = workspace.lock()?;
-    if let Command::Remote { verbose, command } = command {
-        match command {
-            Some(RemoteCommand::SetUrl { url, .. }) => {
-                scn::client::Client::new(&url, &workspace.root.join(".scn/cache"))?;
-                workspace.state.server = url.trim_end_matches('/').to_owned();
-                workspace.state.remote_main = None;
-                workspace.save()?;
-            }
-            Some(RemoteCommand::GetUrl { .. }) => println!("{}", workspace.state.server),
-            None if verbose => {
-                println!("origin\t{} (fetch)", workspace.state.server);
-                println!("origin\t{} (push)", workspace.state.server);
-            }
-            None => println!("origin"),
-        }
-        return Ok(());
-    }
-    let client = workspace.client()?;
-    let rebase = matches!(&command, Command::Rebase { .. });
-    match command {
-        Command::Tag(args) => tags(args, &workspace, &client).await?,
-        Command::Status => {
-            let files = workspace.scan()?;
-            let index = workspace.staged_tree();
-            let staged = changes_between(&workspace.state.files, &index);
-            let unstaged = changes_between(&index, &files);
-            let paths: std::collections::BTreeSet<_> =
-                staged.keys().chain(unstaged.keys()).collect();
-            for path in &paths {
-                if !workspace.state.files.contains_key(*path) && !index.contains_key(*path) {
-                    println!("?? {path}");
-                    continue;
+    let (mut workspace, lock) = scn::worker::io(|| {
+        let workspace = Workspace::find(&std::env::current_dir()?)?;
+        let lock = workspace.lock()?;
+        Ok((workspace, lock))
+    })
+    .await?;
+    let result = async {
+        if let Command::Remote { verbose, command } = command {
+            match command {
+                Some(RemoteCommand::SetUrl { url, .. }) => {
+                    scn::client::Client::new(&url, &workspace.root.join(".scn/cache")).await?;
+                    workspace.state.server = url.trim_end_matches('/').to_owned();
+                    workspace.state.remote_main = None;
+                    workspace.on_disk(|w| w.save()).await?;
                 }
-                let status = |changes: &Changes, before: &Tree| match changes.get(*path) {
-                    None => ' ',
-                    Some(None) => 'D',
-                    Some(Some(_)) if !before.contains_key(*path) => 'A',
-                    Some(_) => 'M',
+                Some(RemoteCommand::GetUrl { .. }) => println!("{}", workspace.state.server),
+                None if verbose => {
+                    println!("origin\t{} (fetch)", workspace.state.server);
+                    println!("origin\t{} (push)", workspace.state.server);
+                }
+                None => println!("origin"),
+            }
+            return Ok(());
+        }
+        let client = workspace.client().await?;
+        let rebase = matches!(&command, Command::Rebase { .. });
+        match command {
+            Command::Tag(args) => tags(args, &workspace, &client).await?,
+            Command::Status => {
+                workspace
+                    .on_disk(|w| {
+                        let files = w.scan()?;
+                        let index = w.staged_tree();
+                        let staged = changes_between(&w.state.files, &index);
+                        let unstaged = changes_between(&index, &files);
+                        let paths: std::collections::BTreeSet<_> =
+                            staged.keys().chain(unstaged.keys()).collect();
+                        for path in &paths {
+                            if !w.state.files.contains_key(*path) && !index.contains_key(*path) {
+                                println!("?? {path}");
+                                continue;
+                            }
+                            let status = |changes: &Changes, before: &Tree| match changes.get(*path)
+                            {
+                                None => ' ',
+                                Some(None) => 'D',
+                                Some(Some(_)) if !before.contains_key(*path) => 'A',
+                                Some(_) => 'M',
+                            };
+                            println!(
+                                "{}{} {path}",
+                                status(&staged, &w.state.files),
+                                status(&unstaged, &index)
+                            );
+                        }
+                        if paths.is_empty() {
+                            println!("Working copy clean");
+                        }
+                        Ok(())
+                    })
+                    .await?;
+            }
+
+            Command::Add { paths, all } => {
+                let cwd = if all {
+                    workspace.root.clone()
+                } else {
+                    std::env::current_dir()?
                 };
-                println!(
-                    "{}{} {path}",
-                    status(&staged, &workspace.state.files),
-                    status(&unstaged, &index)
-                );
+                let paths = if all { vec![".".into()] } else { paths };
+                workspace
+                    .on_disk(move |w| w.stage(&paths, &cwd, false))
+                    .await?;
             }
-            if paths.is_empty() {
-                println!("Working copy clean");
+            Command::Commit {
+                message,
+                author: name,
+                all,
+            } => {
+                if all {
+                    workspace
+                        .on_disk(|w| w.stage(&[".".into()], &w.root.clone(), true))
+                        .await?;
+                }
+                let commit = workspace
+                    .commit_staged(&client, message, author(name))
+                    .await?;
+                println!("{} {}", commit.id, commit.message);
             }
-        }
-        Command::Add { paths, all } => {
-            let cwd = if all {
-                workspace.root.clone()
-            } else {
-                std::env::current_dir()?
-            };
-            let paths = if all { vec![".".into()] } else { paths };
-            workspace.stage(&paths, &cwd, false)?;
-        }
-        Command::Commit {
-            message,
-            author: name,
-            all,
-        } => {
-            if all {
-                workspace.stage(&[".".into()], &workspace.root.clone(), true)?;
+            Command::Checkout {
+                revision,
+                sparse,
+                full,
+            } => {
+                let sparse = if full {
+                    Some(vec![])
+                } else if sparse.is_empty() {
+                    None
+                } else {
+                    Some(sparse)
+                };
+                workspace.checkout(&client, &revision, sparse).await?;
+                println!("Checked out {}", workspace.state.revision.unwrap());
             }
-            let commit = workspace
-                .commit_staged(&client, message, author(name))
-                .await?;
-            println!("{} {}", commit.id, commit.message);
-        }
-        Command::Checkout {
-            revision,
-            sparse,
-            full,
-        } => {
-            let sparse = if full {
-                Some(vec![])
-            } else if sparse.is_empty() {
-                None
-            } else {
-                Some(sparse)
-            };
-            workspace.checkout(&client, &revision, sparse).await?;
-            println!("Checked out {}", workspace.state.revision.unwrap());
-        }
-        Command::Diff { from, to, cached } => {
-            if let (Some(from), Some(to)) = (from, to) {
-                let from = revision_segment(&workspace.revision(&from)?)?;
-                let to = revision_segment(&workspace.revision(&to)?)?;
-                let diff: Vec<DiffEntry> =
-                    client.get(&format!("/v1/diff/{from}/{to}"), &[]).await?;
-                for entry in diff {
-                    print_diff(
-                        &entry.path,
-                        entry.before.as_ref(),
-                        entry.after.as_ref(),
-                        entry.patch,
+            Command::Diff { from, to, cached } => {
+                if let (Some(from), Some(to)) = (from, to) {
+                    let from = revision_segment(&workspace.revision(&from)?)?;
+                    let to = revision_segment(&workspace.revision(&to)?)?;
+                    let diff: Vec<DiffEntry> =
+                        client.get(&format!("/v1/diff/{from}/{to}"), &[]).await?;
+                    for entry in diff {
+                        print_diff(
+                            &entry.path,
+                            entry.before.as_ref(),
+                            entry.after.as_ref(),
+                            entry.patch,
+                        );
+                    }
+                } else {
+                    let (index, mut files) = workspace
+                        .on_disk(move |w| {
+                            let index = w.staged_tree();
+                            let files = if cached { index.clone() } else { w.scan()? };
+                            Ok((index, files))
+                        })
+                        .await?;
+                    if !cached {
+                        files.retain(|path, _| index.contains_key(path));
+                    }
+                    let base = if cached {
+                        workspace.state.files.clone()
+                    } else {
+                        index.clone()
+                    };
+                    for (path, entry) in changes_between(&base, &files) {
+                        let before = base.get(&path);
+                        if before.is_some_and(|entry| entry.manifest.is_some())
+                            || entry.as_ref().is_some_and(|entry| entry.manifest.is_some())
+                        {
+                            print_diff(&path, before, entry.as_ref(), None);
+                            continue;
+                        }
+                        let old = if let Some(before) = before {
+                            if !cached
+                                && workspace
+                                    .state
+                                    .index
+                                    .get(&path)
+                                    .is_some_and(Option::is_some)
+                            {
+                                {
+                                    let id = before.blob.clone();
+                                    workspace.on_disk(move |w| w.staged_blob(&id)).await?
+                                }
+                            } else {
+                                client.blob(&before.blob).await?
+                            }
+                        } else {
+                            vec![]
+                        };
+                        let new = if let Some(entry) = &entry {
+                            if cached {
+                                {
+                                    let id = entry.blob.clone();
+                                    workspace.on_disk(move |w| w.staged_blob(&id)).await?
+                                }
+                            } else {
+                                {
+                                    let path = path.clone();
+                                    workspace
+                                        .on_disk(move |w| Ok(fs::read(w.path(&path)?)?))
+                                        .await?
+                                }
+                            }
+                        } else {
+                            vec![]
+                        };
+                        let owned = path.clone();
+                        let patch = scn::worker::cpu(move || Ok(patch(&owned, &old, &new))).await?;
+                        print_diff(&path, before, entry.as_ref(), patch);
+                    }
+                }
+            }
+            Command::Log {
+                revision,
+                limit,
+                path,
+            } => {
+                if revision == "HEAD" && workspace.state.revision.is_none() {
+                    println!("No changesets");
+                    return Ok(());
+                }
+                let revision = revision_segment(&workspace.revision(&revision)?)?;
+                let mut query = vec![("limit", limit.to_string())];
+                if let Some(path) = path {
+                    validate_path(&path)?;
+                    query.push(("path", path));
+                }
+                let commits: Vec<Commit> =
+                    client.get(&format!("/v1/log/{revision}"), &query).await?;
+                for commit in commits {
+                    println!(
+                        "{} {} {}\n    {}",
+                        commit.id,
+                        commit.author,
+                        commit.timestamp / 1_000_000_000,
+                        commit.message
                     );
                 }
-            } else {
-                let index = workspace.staged_tree();
-                let mut files = if cached {
-                    index.clone()
+            }
+            Command::Show { revision, path } => {
+                let revision = workspace.revision(&revision)?;
+                let commit = client.commit(&revision).await?;
+                if let Some(path) = path {
+                    validate_path(&path)?;
+                    let tree = client.tree(&commit.id, std::slice::from_ref(&path)).await?;
+                    let entry = tree.get(&path).context("file not found in this revision")?;
+                    client.write_file(entry, io::stdout()).await?;
                 } else {
-                    workspace.scan()?
-                };
-                if !cached {
-                    files.retain(|path, _| index.contains_key(path));
+                    println!("{}", serde_json::to_string_pretty(&commit)?);
                 }
-                let base = if cached {
-                    &workspace.state.files
-                } else {
-                    &index
-                };
-                for (path, entry) in changes_between(base, &files) {
-                    let before = base.get(&path);
-                    if before.is_some_and(|entry| entry.manifest.is_some())
-                        || entry.as_ref().is_some_and(|entry| entry.manifest.is_some())
-                    {
-                        print_diff(&path, before, entry.as_ref(), None);
-                        continue;
+            }
+            Command::Blame { path, rev } => {
+                validate_path(&path)?;
+                let revision = revision_segment(&workspace.revision(&rev)?)?;
+                let lines: Vec<BlameLine> = client
+                    .get(&format!("/v1/blame/{revision}"), &[("path", path)])
+                    .await?;
+                for (index, line) in lines.iter().enumerate() {
+                    print!(
+                        "{} {:>4} {} | {}",
+                        &line.commit[..12],
+                        index + 1,
+                        line.author,
+                        line.line
+                    );
+                    if !line.line.ends_with('\n') {
+                        println!();
                     }
-                    let old = if let Some(before) = before {
-                        if !cached
-                            && workspace
-                                .state
-                                .index
-                                .get(&path)
-                                .is_some_and(Option::is_some)
-                        {
-                            workspace.staged_blob(&before.blob)?
-                        } else {
-                            client.blob(&before.blob).await?
-                        }
-                    } else {
-                        vec![]
-                    };
-                    let new = if let Some(entry) = &entry {
-                        if cached {
-                            workspace.staged_blob(&entry.blob)?
-                        } else {
-                            fs::read(workspace.path(&path)?)?
-                        }
-                    } else {
-                        vec![]
-                    };
-                    print_diff(&path, before, entry.as_ref(), patch(&path, &old, &new));
                 }
             }
-        }
-        Command::Log {
-            revision,
-            limit,
-            path,
-        } => {
-            if revision == "HEAD" && workspace.state.revision.is_none() {
-                println!("No changesets");
-                return Ok(());
+            Command::Merge {
+                revision,
+                author: name,
             }
-            let revision = revision_segment(&workspace.revision(&revision)?)?;
-            let mut query = vec![("limit", limit.to_string())];
-            if let Some(path) = path {
-                validate_path(&path)?;
-                query.push(("path", path));
+            | Command::Rebase {
+                revision,
+                author: name,
+            } => {
+                workspace.on_disk(|w| w.ensure_clean()).await?;
+                let route = if rebase { "/v1/rebase" } else { "/v1/merge" };
+                let head = workspace.revision("HEAD")?;
+                let onto = workspace.revision(&revision)?;
+                let commit: Commit = client
+                    .post(
+                        route,
+                        &IntegrateRequest {
+                            head,
+                            onto,
+                            author: author(name),
+                        },
+                    )
+                    .await?;
+                workspace
+                    .materialize(
+                        &client,
+                        Some(commit.id.clone()),
+                        workspace.state.sparse.clone(),
+                    )
+                    .await?;
+                println!("{} {}", commit.id, commit.message);
             }
-            let commits: Vec<Commit> = client.get(&format!("/v1/log/{revision}"), &query).await?;
-            for commit in commits {
+            Command::Fetch { .. } => {
+                let target = workspace.fetch(&client).await?;
+                println!("origin/main -> {}", target.as_deref().unwrap_or("empty"));
+            }
+            Command::Pull {
+                rebase, ff_only, ..
+            } => {
+                workspace
+                    .pull(&client, rebase, ff_only, author(None))
+                    .await?;
                 println!(
-                    "{} {} {}\n    {}",
-                    commit.id,
-                    commit.author,
-                    commit.timestamp / 1_000_000_000,
-                    commit.message
+                    "HEAD -> {}",
+                    workspace.state.revision.as_deref().unwrap_or("empty")
                 );
             }
-        }
-        Command::Show { revision, path } => {
-            let revision = workspace.revision(&revision)?;
-            let commit = client.commit(&revision).await?;
-            if let Some(path) = path {
-                validate_path(&path)?;
-                let tree = client.tree(&commit.id, std::slice::from_ref(&path)).await?;
-                let entry = tree.get(&path).context("file not found in this revision")?;
-                client.write_file(entry, &mut io::stdout().lock()).await?;
-            } else {
-                println!("{}", serde_json::to_string_pretty(&commit)?);
+            Command::Push { .. } => {
+                let head = workspace.revision("HEAD")?;
+                client.land(head.clone()).await?;
+                workspace.state.remote_main = Some(head.clone());
+                workspace.on_disk(|w| w.save()).await?;
+                println!("main -> {head}");
             }
+            _ => bail!("unexpected command"),
         }
-        Command::Blame { path, rev } => {
-            validate_path(&path)?;
-            let revision = revision_segment(&workspace.revision(&rev)?)?;
-            let lines: Vec<BlameLine> = client
-                .get(&format!("/v1/blame/{revision}"), &[("path", path)])
-                .await?;
-            for (index, line) in lines.iter().enumerate() {
-                print!(
-                    "{} {:>4} {} | {}",
-                    &line.commit[..12],
-                    index + 1,
-                    line.author,
-                    line.line
-                );
-                if !line.line.ends_with('\n') {
-                    println!();
-                }
-            }
-        }
-        Command::Merge {
-            revision,
-            author: name,
-        }
-        | Command::Rebase {
-            revision,
-            author: name,
-        } => {
-            workspace.ensure_clean()?;
-            let route = if rebase { "/v1/rebase" } else { "/v1/merge" };
-            let head = workspace.revision("HEAD")?;
-            let onto = workspace.revision(&revision)?;
-            let commit: Commit = client
-                .post(
-                    route,
-                    &IntegrateRequest {
-                        head,
-                        onto,
-                        author: author(name),
-                    },
-                )
-                .await?;
-            workspace
-                .materialize(
-                    &client,
-                    Some(commit.id.clone()),
-                    workspace.state.sparse.clone(),
-                )
-                .await?;
-            println!("{} {}", commit.id, commit.message);
-        }
-        Command::Fetch { .. } => {
-            let target = workspace.fetch(&client).await?;
-            println!("origin/main -> {}", target.as_deref().unwrap_or("empty"));
-        }
-        Command::Pull {
-            rebase, ff_only, ..
-        } => {
-            workspace
-                .pull(&client, rebase, ff_only, author(None))
-                .await?;
-            println!(
-                "HEAD -> {}",
-                workspace.state.revision.as_deref().unwrap_or("empty")
-            );
-        }
-        Command::Push { .. } => {
-            let head = workspace.revision("HEAD")?;
-            client.land(head.clone()).await?;
-            workspace.state.remote_main = Some(head.clone());
-            workspace.save()?;
-            println!("main -> {head}");
-        }
-        _ => bail!("unexpected command"),
+        Ok(())
     }
-    Ok(())
+    .await;
+    let released = lock.release().await;
+    result.and(released)
 }

@@ -1,6 +1,6 @@
 use crate::{
     model::*,
-    server::{ApiError, ApiState, RequestLimits, blocking, limit_requests},
+    server::{ApiError, ApiState, RequestLimits, execute, limit_requests},
     storage::{Backend, Local},
     store::{MAX_BLOB, verify_blob},
 };
@@ -36,11 +36,14 @@ pub fn router_with_limits(local: Local, limits: RequestLimits) -> Router {
 async fn blob(
     local: ApiState<Local>,
     Path(id): Path<String>,
-) -> Result<([(axum::http::HeaderName, &'static str); 2], Vec<u8>), ApiError> {
-    let bytes = blocking(local, move |local| {
-        let bytes = local.blobs.get(&id)?;
-        verify_blob(&bytes, &id)?;
-        Ok(bytes)
+) -> Result<([(axum::http::HeaderName, &'static str); 2], Bytes), ApiError> {
+    let bytes = execute(local, move |local| async move {
+        let bytes = local.blobs.get(&id).await?;
+        crate::worker::cpu(move || {
+            verify_blob(&bytes, &id)?;
+            Ok(bytes)
+        })
+        .await
     })
     .await?;
     Ok((
@@ -57,10 +60,14 @@ async fn put_blob(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    blocking(local, move |local| {
-        validate_id(&id)?;
-        let size = verify_blob(&body, &id)?;
-        local.put_blob(&id, &body, size, None)
+    execute(local, move |local| async move {
+        let (id, body, size) = crate::worker::cpu(move || {
+            validate_id(&id)?;
+            let size = verify_blob(&body, &id)?;
+            Ok((id, body, size))
+        })
+        .await?;
+        local.put_blob(&id, body, size, None).await
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -68,7 +75,12 @@ async fn put_blob(
 
 async fn has_blob(local: ApiState<Local>, Path(id): Path<String>) -> Result<Response, ApiError> {
     Ok(
-        match blocking(local, move |local| local.blob_size(&id)).await? {
+        match execute(
+            local,
+            move |local| async move { local.blob_size(&id).await },
+        )
+        .await?
+        {
             Some(size) => (
                 StatusCode::NO_CONTENT,
                 [("x-scn-blob-size", size.to_string())],
@@ -83,7 +95,12 @@ async fn commit(
     local: ApiState<Local>,
     Path(id): Path<String>,
 ) -> Result<Json<StoredCommit>, ApiError> {
-    Ok(Json(blocking(local, move |local| local.header(&id)).await?))
+    Ok(Json(
+        execute(local, move |local| async move {
+            crate::worker::io(move || local.header(&id)).await
+        })
+        .await?,
+    ))
 }
 
 async fn put_commit(
@@ -91,7 +108,10 @@ async fn put_commit(
     Path(id): Path<String>,
     Json(header): Json<StoredCommit>,
 ) -> Result<StatusCode, ApiError> {
-    blocking(local, move |local| local.put_header(&id, header)).await?;
+    execute(local, move |local| async move {
+        crate::worker::io(move || local.put_header(&id, header)).await
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -100,7 +120,10 @@ async fn changes(
     Path(id): Path<String>,
 ) -> Result<Json<Changes>, ApiError> {
     Ok(Json(
-        blocking(local, move |local| local.changes(&id)).await?,
+        execute(local, move |local| async move {
+            crate::worker::io(move || local.changes(&id)).await
+        })
+        .await?,
     ))
 }
 
@@ -109,6 +132,9 @@ async fn put_changes(
     Path(id): Path<String>,
     Json(changes): Json<Changes>,
 ) -> Result<StatusCode, ApiError> {
-    blocking(local, move |local| local.put_changes(&id, changes)).await?;
+    execute(local, move |local| async move {
+        crate::worker::io(move || local.put_changes(&id, changes)).await
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

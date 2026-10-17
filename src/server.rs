@@ -197,13 +197,16 @@ fn with_request_limit(router: Router, admission: Arc<Admission>) -> Router {
     ))
 }
 
-pub(crate) async fn blocking<T: Send + 'static, S: Send + 'static>(
-    state: ApiState<S>,
-    work: impl FnOnce(S) -> Result<T> + Send + 'static,
-) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(move || {
+pub(crate) async fn execute<T, S, F, Fut>(state: ApiState<S>, work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    S: Send + 'static,
+    F: FnOnce(S) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    tokio::spawn(async move {
         let _permit = state.permit;
-        work(state.value)
+        work(state.value).await
     })
     .await
     .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
@@ -258,34 +261,42 @@ pub async fn serve_router(router: Router, address: &str) -> Result<()> {
 
 async fn main_ref(store: ApiState<Store>) -> Result<Json<RefValue>, ApiError> {
     Ok(Json(RefValue {
-        target: blocking(store, |s| s.main_ref()).await?,
+        target: execute(store, move |s| async move { s.main_ref().await }).await?,
     }))
 }
 
 async fn tags(store: ApiState<Store>) -> Result<Json<Vec<Tag>>, ApiError> {
-    Ok(Json(blocking(store, |s| s.tags()).await?))
+    Ok(Json(
+        execute(store, move |s| async move { s.tags().await }).await?,
+    ))
 }
 
 async fn tag(store: ApiState<Store>, Path(name): Path<String>) -> Result<Json<Tag>, ApiError> {
-    Ok(Json(blocking(store, move |s| s.tag(&name)).await?))
+    Ok(Json(
+        execute(store, move |s| async move { s.tag(&name).await }).await?,
+    ))
 }
 
 async fn create_tag(
     store: ApiState<Store>,
     Json(request): Json<TagRequest>,
 ) -> Result<Json<Tag>, ApiError> {
-    Ok(Json(blocking(store, move |s| s.create_tag(request)).await?))
+    Ok(Json(
+        execute(store, move |s| async move { s.create_tag(request).await }).await?,
+    ))
 }
 
 async fn import_tag(store: ApiState<Store>, Json(tag): Json<Tag>) -> Result<Json<Tag>, ApiError> {
-    Ok(Json(blocking(store, move |s| s.import_tag(tag)).await?))
+    Ok(Json(
+        execute(store, move |s| async move { s.import_tag(tag).await }).await?,
+    ))
 }
 
 async fn delete_tag(
     store: ApiState<Store>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    blocking(store, move |s| s.delete_tag(&name)).await?;
+    execute(store, move |s| async move { s.delete_tag(&name).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -293,7 +304,7 @@ async fn update_main(
     store: ApiState<Store>,
     Json(request): Json<RefUpdate>,
 ) -> Result<StatusCode, ApiError> {
-    blocking(store, |s| s.update_main(request))
+    execute(store, move |s| async move { s.update_main(request).await })
         .await
         .map_err(|error| ApiError(StatusCode::CONFLICT, error.1))?;
     Ok(StatusCode::NO_CONTENT)
@@ -310,12 +321,17 @@ async fn put_blob(
     body: Bytes,
 ) -> Result<Json<RefValue>, ApiError> {
     Ok(Json(RefValue {
-        target: Some(blocking(store, move |s| s.put_blob_at(&body, query.path.as_deref())).await?),
+        target: Some(
+            execute(store, move |s| async move {
+                s.put_blob_at(body, query.path.as_deref()).await
+            })
+            .await?,
+        ),
     }))
 }
 
 async fn get_blob(store: ApiState<Store>, Path(id): Path<String>) -> Result<Response, ApiError> {
-    let bytes = blocking(store, move |s| s.compressed_blob(&id)).await?;
+    let bytes = execute(store, move |s| async move { s.compressed_blob(&id).await }).await?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/zstd"),
@@ -327,18 +343,26 @@ async fn get_blob(store: ApiState<Store>, Path(id): Path<String>) -> Result<Resp
 }
 
 async fn has_blob(store: ApiState<Store>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
-    Ok(if blocking(store, move |s| s.has_blob(&id)).await? {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    })
+    Ok(
+        if execute(store, move |s| async move { s.has_blob(&id).await }).await? {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::NOT_FOUND
+        },
+    )
 }
 
 async fn create_commit(
     store: ApiState<Store>,
     Json(request): Json<CommitRequest>,
 ) -> Result<Json<Commit>, ApiError> {
-    Ok(Json(blocking(store, |s| s.create_commit(request)).await?))
+    Ok(Json(
+        execute(
+            store,
+            move |s| async move { s.create_commit(request).await },
+        )
+        .await?,
+    ))
 }
 
 async fn prepare_file(
@@ -346,7 +370,7 @@ async fn prepare_file(
     Json(request): Json<FileRequest>,
 ) -> Result<Json<FileEntry>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| s.prepare_file(request)).await?,
+        execute(store, move |s| async move { s.prepare_file(request).await }).await?,
     ))
 }
 
@@ -354,7 +378,13 @@ async fn import_commit(
     store: ApiState<Store>,
     Json(request): Json<ImportCommitRequest>,
 ) -> Result<Json<Commit>, ApiError> {
-    Ok(Json(blocking(store, |s| s.import_commit(request)).await?))
+    Ok(Json(
+        execute(
+            store,
+            move |s| async move { s.import_commit(request).await },
+        )
+        .await?,
+    ))
 }
 
 async fn get_commit(
@@ -362,7 +392,10 @@ async fn get_commit(
     Path(revision): Path<String>,
 ) -> Result<Json<Commit>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| s.get_commit(&s.resolve(&revision)?)).await?,
+        execute(store, move |s| async move {
+            s.get_commit(&s.resolve(&revision).await?).await
+        })
+        .await?,
     ))
 }
 
@@ -377,11 +410,11 @@ async fn tree(
     Query(query): Query<TreeQuery>,
 ) -> Result<Json<Tree>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| {
+        execute(store, move |s| async move {
             if let Some(prefix) = &query.prefix {
                 validate_path(prefix)?;
             }
-            let mut tree = s.tree(&s.resolve(&revision)?)?;
+            let mut tree = s.tree(&s.resolve(&revision).await?).await?;
             if let Some(prefix) = query.prefix {
                 tree.retain(|path, _| selected(path, std::slice::from_ref(&prefix)));
             }
@@ -403,12 +436,13 @@ async fn log(
     Query(query): Query<LogQuery>,
 ) -> Result<Json<Vec<Commit>>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| {
+        execute(store, move |s| async move {
             s.log(
-                &s.resolve(&revision)?,
+                &s.resolve(&revision).await?,
                 query.limit.unwrap_or(20).min(1000),
                 query.path.as_deref(),
             )
+            .await
         })
         .await?,
     ))
@@ -419,7 +453,11 @@ async fn diff(
     Path((from, to)): Path<(String, String)>,
 ) -> Result<Json<Vec<DiffEntry>>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| s.diff(&s.resolve(&from)?, &s.resolve(&to)?)).await?,
+        execute(store, move |s| async move {
+            s.diff(&s.resolve(&from).await?, &s.resolve(&to).await?)
+                .await
+        })
+        .await?,
     ))
 }
 
@@ -429,8 +467,9 @@ async fn merge_base(
 ) -> Result<Json<RefValue>, ApiError> {
     Ok(Json(RefValue {
         target: Some(
-            blocking(store, move |s| {
-                s.merge_base(&s.resolve(&left)?, &s.resolve(&right)?)
+            execute(store, move |s| async move {
+                s.merge_base(&s.resolve(&left).await?, &s.resolve(&right).await?)
+                    .await
             })
             .await?,
         ),
@@ -448,7 +487,10 @@ async fn blame(
     Query(query): Query<BlameQuery>,
 ) -> Result<Json<Vec<BlameLine>>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| s.blame(&s.resolve(&revision)?, &query.path)).await?,
+        execute(store, move |s| async move {
+            s.blame(&s.resolve(&revision).await?, &query.path).await
+        })
+        .await?,
     ))
 }
 
@@ -457,12 +499,13 @@ async fn merge(
     Json(request): Json<IntegrateRequest>,
 ) -> Result<Json<Commit>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| {
+        execute(store, move |s| async move {
             s.merge(
-                &s.resolve(&request.head)?,
-                &s.resolve(&request.onto)?,
+                &s.resolve(&request.head).await?,
+                &s.resolve(&request.onto).await?,
                 &request.author,
             )
+            .await
         })
         .await?,
     ))
@@ -473,12 +516,13 @@ async fn rebase(
     Json(request): Json<IntegrateRequest>,
 ) -> Result<Json<Commit>, ApiError> {
     Ok(Json(
-        blocking(store, move |s| {
+        execute(store, move |s| async move {
             s.rebase(
-                &s.resolve(&request.head)?,
-                &s.resolve(&request.onto)?,
+                &s.resolve(&request.head).await?,
+                &s.resolve(&request.onto).await?,
                 &request.author,
             )
+            .await
         })
         .await?,
     ))
@@ -595,13 +639,16 @@ mod tests {
                 .route(
                     "/work",
                     post(|state: ApiState<Arc<Gate>>| async {
-                        blocking(state, |gate| {
-                            gate.started.fetch_add(1, Ordering::SeqCst);
-                            let mut released = gate.released.lock().unwrap();
-                            while !*released {
-                                released = gate.wake.wait(released).unwrap();
-                            }
-                            Ok(StatusCode::NO_CONTENT)
+                        execute(state, |gate| async move {
+                            crate::worker::io(move || {
+                                gate.started.fetch_add(1, Ordering::SeqCst);
+                                let mut released = gate.released.lock().unwrap();
+                                while !*released {
+                                    released = gate.wake.wait(released).unwrap();
+                                }
+                                Ok(StatusCode::NO_CONTENT)
+                            })
+                            .await
                         })
                         .await
                     }),
@@ -749,7 +796,9 @@ mod tests {
             .with_state(attempts.clone());
         let (url, task) = start(router).await;
         let cache = tempfile::tempdir().unwrap();
-        let client = crate::client::Client::new(&url, cache.path()).unwrap();
+        let client = crate::client::Client::new(&url, cache.path())
+            .await
+            .unwrap();
         assert_eq!(
             client.put_blob(b"upload contents".to_vec()).await.unwrap(),
             hash(b"upload contents")
