@@ -21,21 +21,21 @@ Use the release binary for your platform. No Rust toolchain is required.
 
 | Platform | Download |
 | --- | --- |
-| Linux amd64 | [scn-linux-amd64](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-linux-amd64) |
-| Linux arm64 | [scn-linux-arm64](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-linux-arm64) |
-| macOS arm64 | [scn-macos-arm64](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-macos-arm64) |
+| Linux amd64 | [scn-linux-amd64](https://github.com/adrianchifor/scn/releases/latest/download/scn-linux-amd64) |
+| Linux arm64 | [scn-linux-arm64](https://github.com/adrianchifor/scn/releases/latest/download/scn-linux-arm64) |
+| macOS arm64 | [scn-macos-arm64](https://github.com/adrianchifor/scn/releases/latest/download/scn-macos-arm64) |
 
 Install your chosen binary, for example on Apple Silicon:
 
 ```sh
 mkdir -p ~/.local/bin
-curl -fL https://raw.githubusercontent.com/adrianchifor/scn/main/releases/scn-macos-arm64 -o ~/.local/bin/scn
+curl -fL https://github.com/adrianchifor/scn/releases/latest/download/scn-macos-arm64 -o ~/.local/bin/scn
 chmod +x ~/.local/bin/scn
 export PATH="$HOME/.local/bin:$PATH"
 scn --version
 ```
 
-Linux binaries are statically linked. Checksums are in [SHA256SUMS](https://raw.githubusercontent.com/adrianchifor/scn/main/releases/SHA256SUMS).
+Linux binaries are statically linked. Checksums are in [SHA256SUMS](https://github.com/adrianchifor/scn/releases/latest/download/SHA256SUMS).
 
 ## Local cluster with Docker Compose
 

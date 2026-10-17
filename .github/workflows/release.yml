@@ -1,0 +1,115 @@
+name: Build and release
+
+on:
+  push:
+    tags: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: scn-linux-amd64
+            cc: musl-gcc
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: scn-linux-arm64
+            cc: musl-gcc
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: scn-macos-arm64
+            cc: clang
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Linux tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake musl-tools
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install stable --profile minimal --target "$TARGET"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            build-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Build binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          CC: ${{ matrix.cc }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo +stable build --release --locked --target "$TARGET"
+          mkdir -p dist
+          cp "target/$TARGET/release/scn" "dist/$ASSET"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: scn-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          test -f scn-linux-amd64
+          test -f scn-linux-arm64
+          test -f scn-macos-arm64
+          sha256sum scn-* > SHA256SUMS
+          tag="$RELEASE_TAG"
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$draft" == false ]]; then
+              exit 0
+            fi
+          else
+            gh release create "$tag" --verify-tag --draft --title "$tag" --notes "$tag"
+          fi
+          gh release upload "$tag" scn-linux-amd64 scn-linux-arm64 scn-macos-arm64 SHA256SUMS --clobber
+          gh release edit "$tag" --draft=false --title "$tag" --notes "$tag" --latest

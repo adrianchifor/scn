@@ -1,4 +1,6 @@
 /target
+/dist
+/releases
 /.scn
 /.scn-store
 /.scn-shard
