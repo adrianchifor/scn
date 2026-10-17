@@ -48,12 +48,20 @@ pub enum Blobs {
 }
 
 impl Blobs {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Disk(_) => "disk",
+            Self::S3 { .. } => "s3",
+        }
+    }
+
     pub fn disk(path: &Path) -> Result<Self> {
         fs::create_dir_all(path)?;
         Ok(Self::Disk(path.to_owned()))
     }
 
     pub fn s3(bucket: &str, region: &str, endpoint: Option<&str>, prefix: &str) -> Result<Self> {
+        tracing::info!(bucket, region, "Configuring S3 blob storage");
         let region = match endpoint {
             Some(endpoint) => Region::Custom {
                 region: region.to_owned(),
@@ -80,7 +88,9 @@ impl Blobs {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self, bytes), fields(storage = self.kind(), compressed_bytes = bytes.len()))]
     pub async fn put(&self, id: &str, bytes: Bytes) -> Result<()> {
+        let started = std::time::Instant::now();
         validate_id(id)?;
         match self {
             Self::Disk(directory) => {
@@ -102,12 +112,18 @@ impl Blobs {
                     .await?;
             }
         }
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Blob stored"
+        );
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(storage = self.kind()))]
     pub async fn get(&self, id: &str) -> Result<Bytes> {
+        let started = std::time::Instant::now();
         validate_id(id)?;
-        match self {
+        let bytes = match self {
             Self::Disk(directory) => {
                 let path = directory.join(id);
                 worker::io(move || fs::read(path).map(Bytes::from).context("blob not found")).await
@@ -117,18 +133,32 @@ impl Blobs {
                 .await?
                 .bytes()
                 .clone()),
-        }
+        }?;
+        tracing::debug!(
+            compressed_bytes = bytes.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Blob loaded"
+        );
+        Ok(bytes)
     }
 
+    #[tracing::instrument(level = "debug", skip(self), fields(storage = self.kind()))]
     pub async fn contains(&self, id: &str) -> Result<bool> {
+        let started = std::time::Instant::now();
         validate_id(id)?;
-        match self {
+        let exists = match self {
             Self::Disk(directory) => {
                 let path = directory.join(id);
                 worker::io(move || Ok(path.is_file())).await
             }
             Self::S3 { bucket, prefix } => Ok(bucket.object_exists(Self::key(prefix, id)).await?),
-        }
+        }?;
+        tracing::debug!(
+            exists,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Blob existence checked"
+        );
+        Ok(exists)
     }
 }
 
@@ -154,6 +184,7 @@ impl Local {
              CREATE TABLE IF NOT EXISTS headers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS changes (commit_id TEXT NOT NULL, path TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(commit_id, path));"
         )?;
+        tracing::info!(database = %root.join("scn.db").display(), journal_mode = "WAL", storage = local.blobs.kind(), "Shard storage ready");
         Ok(local)
     }
 

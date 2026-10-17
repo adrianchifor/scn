@@ -371,12 +371,14 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
                 },
             )
             .await?;
-        println!("{id} -> {}", commit.id);
+        tracing::debug!(git_id = id, commit_id = %commit.id, "Imported Git commit");
+        crate::progress::println(&format!("{id} -> {}", commit.id));
         commits.insert(id.to_owned(), commit.id.clone());
         if id == revision {
             tip = Some(commit);
         }
     }
+    let tag_count = tags.len();
     let tip = tip.context("Git revision has no commits")?;
     for mut tag in tags {
         tag.target = commits
@@ -386,5 +388,6 @@ pub async fn import_git(client: &Client, repository: &Path, revision: &str) -> R
         client.post::<Tag>("/v1/import/tags", &tag).await?;
     }
     client.update_main(None, tip.id.clone()).await?;
+    tracing::info!(commits = commits.len(), blobs = blobs.len(), tags = tag_count, commit_id = %tip.id, "Git import completed");
     Ok(tip)
 }

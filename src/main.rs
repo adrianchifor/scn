@@ -2,18 +2,30 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use scn::{
     client::{Client, revision_segment},
+    logging,
     model::*,
-    server,
+    progress, server,
     store::{Store, patch},
     workspace::Workspace,
 };
 use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Arc};
+use tracing::Instrument;
 
 #[derive(Parser)]
 #[command(name = "scn", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "text",
+        env = "SCN_LOG_FORMAT"
+    )]
+    log_format: logging::Format,
+    #[arg(long, global = true)]
+    no_progress: bool,
 }
 
 #[derive(Args)]
@@ -339,8 +351,38 @@ fn mode(entry: Option<&FileEntry>) -> &str {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let command = Cli::parse().command;
+async fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    let component = match &cli.command {
+        Command::Serve { .. } => "server",
+        Command::Shard(ShardArgs {
+            command: Some(_), ..
+        }) => "controller",
+        Command::Shard(_) => "shard",
+        Command::Cache { .. } => "cache",
+        _ => "cli",
+    };
+    let _logging = match logging::init(component, cli.log_format) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let animate = !cli.no_progress && cli.log_format == logging::Format::Text;
+    let result = run(cli.command, animate)
+        .instrument(tracing::info_span!("scn", component))
+        .await;
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(component, error = %format!("{error:#}"), "Command failed");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(command: Command, animate: bool) -> Result<()> {
     match command {
         Command::Cache {
             dir,
@@ -372,10 +414,10 @@ async fn main() -> Result<()> {
                 .await;
             }
             None => {
-                let local = tokio::task::spawn_blocking(move || {
+                let local = scn::worker::io(move || {
                     scn::storage::Local::open(&args.store, args.blobs.storage(&args.store)?)
                 })
-                .await??;
+                .await?;
                 return server::serve_router(
                     scn::shard::router_with_limits(local, args.limits),
                     &args.listen,
@@ -391,7 +433,12 @@ async fn main() -> Result<()> {
             let cache =
                 scn::worker::Cleanup::new(scn::worker::io(|| Ok(tempfile::tempdir()?)).await?);
             let client = scn::client::Client::new(&url, cache.path()).await?;
-            let commit = scn::import::import_git(&client, &repository, &rev).await?;
+            let commit = progress::wait(
+                animate,
+                "Importing Git history",
+                scn::import::import_git(&client, &repository, &rev),
+            )
+            .await?;
             println!("main -> {}", commit.id);
             return Ok(());
         }
@@ -401,10 +448,8 @@ async fn main() -> Result<()> {
             blobs,
             limits,
         } => {
-            let store = tokio::task::spawn_blocking(move || {
-                Store::with_blobs(&store, blobs.storage(&store)?)
-            })
-            .await??;
+            let store =
+                scn::worker::io(move || Store::with_blobs(&store, blobs.storage(&store)?)).await?;
             return server::serve_router(server::router_with_limits(store, limits), &listen).await;
         }
         Command::Clone {
@@ -413,7 +458,12 @@ async fn main() -> Result<()> {
             rev,
             sparse,
         } => {
-            let workspace = Workspace::clone(&url, &directory, &rev, sparse).await?;
+            let workspace = progress::wait(
+                animate,
+                "Cloning repository",
+                Workspace::clone(&url, &directory, &rev, sparse),
+            )
+            .await?;
             println!("Working copy: {}", workspace.root.display());
             return Ok(());
         }
@@ -489,9 +539,12 @@ async fn main() -> Result<()> {
                     std::env::current_dir()?
                 };
                 let paths = if all { vec![".".into()] } else { paths };
-                workspace
-                    .on_disk(move |w| w.stage(&paths, &cwd, false))
-                    .await?;
+                progress::wait(
+                    animate,
+                    "Staging files",
+                    workspace.on_disk(move |w| w.stage(&paths, &cwd, false)),
+                )
+                .await?;
             }
             Command::Commit {
                 message,
@@ -499,13 +552,19 @@ async fn main() -> Result<()> {
                 all,
             } => {
                 if all {
-                    workspace
-                        .on_disk(|w| w.stage(&[".".into()], &w.root.clone(), true))
-                        .await?;
-                }
-                let commit = workspace
-                    .commit_staged(&client, message, author(name))
+                    progress::wait(
+                        animate,
+                        "Staging tracked files",
+                        workspace.on_disk(|w| w.stage(&[".".into()], &w.root.clone(), true)),
+                    )
                     .await?;
+                }
+                let commit = progress::wait(
+                    animate,
+                    "Uploading changes and creating commit",
+                    workspace.commit_staged(&client, message, author(name)),
+                )
+                .await?;
                 println!("{} {}", commit.id, commit.message);
             }
             Command::Checkout {
@@ -520,7 +579,12 @@ async fn main() -> Result<()> {
                 } else {
                     Some(sparse)
                 };
-                workspace.checkout(&client, &revision, sparse).await?;
+                progress::wait(
+                    animate,
+                    "Checking out files",
+                    workspace.checkout(&client, &revision, sparse),
+                )
+                .await?;
                 println!("Checked out {}", workspace.state.revision.unwrap());
             }
             Command::Diff { from, to, cached } => {
@@ -672,35 +736,49 @@ async fn main() -> Result<()> {
                 let route = if rebase { "/v1/rebase" } else { "/v1/merge" };
                 let head = workspace.revision("HEAD")?;
                 let onto = workspace.revision(&revision)?;
-                let commit: Commit = client
-                    .post(
+                let commit: Commit = progress::wait(
+                    animate,
+                    if rebase {
+                        "Rebasing changes"
+                    } else {
+                        "Merging changes"
+                    },
+                    client.post(
                         route,
                         &IntegrateRequest {
                             head,
                             onto,
                             author: author(name),
                         },
-                    )
-                    .await?;
-                workspace
-                    .materialize(
+                    ),
+                )
+                .await?;
+                progress::wait(
+                    animate,
+                    "Updating working files",
+                    workspace.materialize(
                         &client,
                         Some(commit.id.clone()),
                         workspace.state.sparse.clone(),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 println!("{} {}", commit.id, commit.message);
             }
             Command::Fetch { .. } => {
-                let target = workspace.fetch(&client).await?;
+                let target =
+                    progress::wait(animate, "Fetching main", workspace.fetch(&client)).await?;
                 println!("origin/main -> {}", target.as_deref().unwrap_or("empty"));
             }
             Command::Pull {
                 rebase, ff_only, ..
             } => {
-                workspace
-                    .pull(&client, rebase, ff_only, author(None))
-                    .await?;
+                progress::wait(
+                    animate,
+                    "Pulling changes",
+                    workspace.pull(&client, rebase, ff_only, author(None)),
+                )
+                .await?;
                 println!(
                     "HEAD -> {}",
                     workspace.state.revision.as_deref().unwrap_or("empty")
@@ -708,7 +786,7 @@ async fn main() -> Result<()> {
             }
             Command::Push { .. } => {
                 let head = workspace.revision("HEAD")?;
-                client.land(head.clone()).await?;
+                progress::wait(animate, "Pushing main", client.land(head.clone())).await?;
                 workspace.state.remote_main = Some(head.clone());
                 workspace.on_disk(|w| w.save()).await?;
                 println!("main -> {head}");

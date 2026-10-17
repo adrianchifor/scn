@@ -1,13 +1,19 @@
 name: scn
 
+x-scn-environment: &scn-environment
+  RUST_LOG: ${RUST_LOG:-warn,scn=info}
+  SCN_LOG_FORMAT: ${SCN_LOG_FORMAT:-text}
+
 x-scn: &scn
   build:
     context: ..
     dockerfile: deploy/Dockerfile
   image: scn:local
   restart: unless-stopped
+  environment: *scn-environment
 
 x-s3-environment: &s3-environment
+  <<: *scn-environment
   AWS_ACCESS_KEY_ID: ${SCN_S3_ACCESS_KEY:-SCNLOCAL}
   AWS_SECRET_ACCESS_KEY: ${SCN_S3_SECRET_KEY:-scn-local-secret-change-me}
   AWS_DEFAULT_REGION: us-east-1

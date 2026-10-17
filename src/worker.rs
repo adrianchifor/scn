@@ -7,9 +7,10 @@ async fn execute<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let permit = slots.clone().acquire_owned().await?;
+    let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        work()
+        span.in_scope(work)
     })
     .await?
 }

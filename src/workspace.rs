@@ -283,6 +283,7 @@ impl Workspace {
                 Err(error) => return Err(error.into()),
             }
         }
+        tracing::debug!(root = %self.root.display(), files = files.len(), sparse_prefixes = self.state.sparse.len(), "Working copy scanned");
         Ok(files)
     }
 
@@ -407,6 +408,7 @@ impl Workspace {
         self.state.index = index;
         self.save()?;
         self.prune_staged()?;
+        tracing::debug!(paths = self.state.index.len(), "Files staged");
         Ok(())
     }
 
@@ -459,6 +461,11 @@ impl Workspace {
                 }
             }
         }
+        tracing::debug!(
+            blobs = uploads.len(),
+            paths = changes.len(),
+            "Uploading staged blobs"
+        );
         let directory = self.root.join(".scn/staged");
         stream::iter(uploads)
             .map(|(id, path): (String, Option<String>)| {
@@ -575,6 +582,12 @@ impl Workspace {
         };
         validate_tree(&tree)?;
         let changes = changes_between(&self.state.files, &tree);
+        tracing::debug!(
+            ?revision,
+            changed_paths = changes.len(),
+            files = tree.len(),
+            "Preparing checkout"
+        );
         let targets: Vec<_> = changes
             .keys()
             .filter(|path| tree.contains_key(*path))
@@ -664,6 +677,7 @@ impl Workspace {
             w.state.sparse = sparse;
             w.state.files = tree;
             w.save()?;
+            tracing::debug!(revision = ?w.state.revision, files = w.state.files.len(), "Working files updated");
             Ok(())
         })
         .await?;

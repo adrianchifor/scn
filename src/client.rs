@@ -54,27 +54,46 @@ impl Client {
     async fn response(response: Response) -> Result<Response> {
         if !response.status().is_success() {
             let status = response.status();
+            let request_id = response
+                .headers()
+                .get(crate::logging::REQUEST_ID)
+                .and_then(|id| id.to_str().ok())
+                .map(str::to_owned);
             let body = response.text().await?;
             let message = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|value| value["error"].as_str().map(str::to_owned))
                 .unwrap_or(body);
+            if let Some(request_id) = request_id {
+                anyhow::bail!("server {status} (request {request_id}): {message}");
+            }
             anyhow::bail!("server {status}: {message}");
         }
         Ok(response)
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<Response> {
+        let request_id = crate::logging::request_id();
+        let request = request
+            .header(crate::logging::REQUEST_ID, &request_id)
+            .build()?;
         for attempt in 0..6 {
-            let response = request
-                .try_clone()
-                .context("request body cannot be retried")?
-                .send()
+            let started = std::time::Instant::now();
+            tracing::debug!(component = "cli", %request_id, method = %request.method(), endpoint = %request.url().origin().ascii_serialization(), path = request.url().path(), attempt = attempt + 1, "Sending HTTP request");
+            let response = self
+                .http
+                .execute(
+                    request
+                        .try_clone()
+                        .context("request body cannot be retried")?,
+                )
                 .await?;
+            tracing::debug!(component = "cli", %request_id, status = response.status().as_u16(), elapsed_ms = started.elapsed().as_millis() as u64, "HTTP response received");
             if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE || attempt == 5 {
                 return Ok(response);
             }
             let delay = retry_delay(response.headers(), attempt);
+            tracing::warn!(component = "cli", %request_id, attempt = attempt + 1, delay_ms = delay.as_millis() as u64, "Server busy; retrying request");
             drop(response);
             tokio::time::sleep(delay).await;
         }
@@ -264,8 +283,10 @@ impl Client {
                     Ok(())
                 })
                 .await?;
+                tracing::debug!(blob_id = id, bytes = bytes.len(), "Local blob cache hit");
                 return Ok(bytes);
             }
+            tracing::warn!(blob_id = id, "Ignoring corrupt local blob cache entry");
         }
         let response = self
             .send(self.http.get(format!("{}/v1/blobs/{id}", self.url)))

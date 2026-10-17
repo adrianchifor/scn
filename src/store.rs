@@ -258,6 +258,7 @@ impl Store {
         {
             return Err(TagError::Exists(tag.name).into());
         }
+        tracing::info!(tag = %tag.name, target = %tag.target, force, imported, "Tag stored");
         Ok(tag)
     }
 
@@ -267,6 +268,7 @@ impl Store {
             self.backend.delete_tag(name).await?,
             TagError::NotFound(name.to_owned())
         );
+        tracing::info!(tag = name, "Tag deleted");
         Ok(())
     }
 
@@ -277,6 +279,7 @@ impl Store {
         while let Some(id) = current {
             let cached = self.trees.lock().unwrap().get(&id);
             if let Some(cached) = cached {
+                tracing::debug!(commit_id = %id, files = cached.len(), "Tree cache hit");
                 tree = worker::cpu(move || Ok((*cached).clone())).await?;
                 break;
             }
@@ -290,6 +293,7 @@ impl Store {
         let trees = self.trees.clone();
         let id = id.to_owned();
         worker::cpu(move || {
+            tracing::debug!(commit_id = %id, commits = chain.len(), "Reconstructing tree");
             for commit in chain.into_iter().rev() {
                 apply(&mut tree, &commit.changes);
             }
@@ -391,6 +395,7 @@ impl Store {
             Ok(())
         })
         .await?;
+        tracing::info!(commit_id = %commit.id, parents = commit.parents.len(), paths = commit.changes.len(), imported, "Commit stored");
         Ok(commit)
     }
 
@@ -402,7 +407,11 @@ impl Store {
                 "main updates must be fast-forward; merge or rebase first"
             );
         }
-        self.backend.update_main(update).await
+        let expected = update.expected.clone();
+        let target = update.target.clone();
+        self.backend.update_main(update).await?;
+        tracing::info!(?expected, %target, "Main advanced");
+        Ok(())
     }
 
     async fn parents(&self, id: &str) -> Result<Vec<String>> {
@@ -517,6 +526,7 @@ impl Store {
         Ok(result)
     }
 
+    #[tracing::instrument(level = "debug", skip(self, author))]
     pub async fn merge(&self, head: &str, other: &str, author: &str) -> Result<Commit> {
         if self.is_ancestor(other, head).await? {
             return self.get_commit(head).await;
@@ -542,6 +552,7 @@ impl Store {
         .await
     }
 
+    #[tracing::instrument(level = "debug", skip(self, author))]
     pub async fn rebase(&self, head: &str, onto: &str, author: &str) -> Result<Commit> {
         if self.is_ancestor(head, onto).await? {
             return self.get_commit(onto).await;

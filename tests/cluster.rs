@@ -43,6 +43,7 @@ impl Valkey {
 
     fn spawn(directory: &Path, port: u16) -> Child {
         let binary = std::env::var("SCN_VALKEY_SERVER").unwrap_or_else(|_| "valkey-server".into());
+        let logs = fs::File::create(directory.join("valkey.log")).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_scn"))
             .args(["cache", "--binary", &binary, "--dir"])
             .arg(directory)
@@ -52,8 +53,8 @@ impl Valkey {
                 "--maxmemory",
                 "64mb",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(logs.try_clone().unwrap()))
+            .stderr(Stdio::from(logs))
             .spawn()
             .unwrap();
         for _ in 0..100 {
@@ -64,10 +65,12 @@ impl Valkey {
             {
                 return child;
             }
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "Valkey exited during startup"
-            );
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!(
+                    "Valkey exited during startup ({status}): {}",
+                    fs::read_to_string(directory.join("valkey.log")).unwrap()
+                );
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         child.kill().unwrap();
@@ -738,4 +741,96 @@ fn shard_and_valkey_requests_progress_with_the_blocking_pool_saturated() {
         result.unwrap().unwrap();
         assert!(maximum.load(Ordering::SeqCst) > 1);
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires valkey-server; set SCN_VALKEY_SERVER and run with --ignored"]
+async fn request_ids_follow_controller_requests_to_shards() {
+    let cache = tokio::task::spawn_blocking(Valkey::start).await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("shard");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let requests = seen.clone();
+    let local = scn::worker::io(move || Local::open(&root, Blobs::disk(&root.join("blobs"))?))
+        .await
+        .unwrap();
+    let shard = start(shard::router(local).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let requests = requests.clone();
+            async move {
+                if let Some(id) = request.headers().get(scn::logging::REQUEST_ID) {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(id.to_str().unwrap().to_owned());
+                }
+                next.run(request).await
+            }
+        },
+    )))
+    .await;
+    let api = controller(&cache.url, vec![shard.url.clone()], 60).await;
+    let http = reqwest::Client::new();
+    let blob: RefValue = http
+        .post(format!("{}/v1/blobs", api.url))
+        .header(scn::logging::REQUEST_ID, "agent-upload-1")
+        .body("request tracing")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(seen.lock().unwrap().iter().any(|id| id == "agent-upload-1"));
+    let response = http
+        .head(format!("{}/v1/blobs/{}", api.url, blob.target.unwrap()))
+        .header(scn::logging::REQUEST_ID, "agent-head-2")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(response.headers()[scn::logging::REQUEST_ID], "agent-head-2");
+    assert!(seen.lock().unwrap().iter().any(|id| id == "agent-head-2"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires valkey-server; set SCN_VALKEY_SERVER and run with --ignored"]
+async fn large_blobs_bypass_the_cache_without_blocking_durable_storage() {
+    let cache = tokio::task::spawn_blocking(Valkey::start).await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let shard = start_shard(&directory.path().join("shard")).await;
+    let api = controller(&cache.url, vec![shard.url.clone()], 60).await;
+    let client = Client::new(&api.url, &directory.path().join("client"))
+        .await
+        .unwrap();
+    let mut state = 1u64;
+    let data: Vec<u8> = (0..4 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let id = client.put_blob(data.clone()).await.unwrap();
+    assert!(
+        !index(&cache.url)
+            .exists::<_, bool>(format!("scn:{{test}}:blob:{id}"))
+            .unwrap()
+    );
+    assert_eq!(client.blob(&id).await.unwrap(), data);
+    assert!(
+        !index(&cache.url)
+            .exists::<_, bool>(format!("scn:{{test}}:blob:{id}"))
+            .unwrap()
+    );
+    let small = client.put_blob(b"cached".to_vec()).await.unwrap();
+    assert!(
+        index(&cache.url)
+            .exists::<_, bool>(format!("scn:{{test}}:blob:{small}"))
+            .unwrap()
+    );
 }

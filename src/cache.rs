@@ -17,6 +17,7 @@ pub fn serve(
         "maxmemory must be a positive size"
     );
     fs::create_dir_all(directory)?;
+    tracing::info!(%listen, maxmemory, appendfsync = fsync, "Starting Valkey");
     let status = Command::new(binary)
         .args([
             "--bind",

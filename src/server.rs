@@ -16,6 +16,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::Instrument;
 
 pub(crate) struct ApiError(pub StatusCode, pub String);
 
@@ -32,6 +33,11 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.0.is_server_error() {
+            tracing::error!(request_id = %crate::logging::request_id(), status = self.0.as_u16(), error = %self.1, "API error");
+        } else {
+            tracing::warn!(request_id = %crate::logging::request_id(), status = self.0.as_u16(), error = %self.1, "API error");
+        }
         (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
     }
 }
@@ -165,8 +171,21 @@ impl Admission {
     }
 }
 
-pub(crate) fn limit_requests(router: Router, limits: RequestLimits) -> Router {
-    with_request_limit(router, Arc::new(Admission::new(limits)))
+pub(crate) fn limit_requests(
+    router: Router,
+    limits: RequestLimits,
+    component: &'static str,
+) -> Router {
+    tracing::info!(
+        component,
+        max_requests = limits.max_requests,
+        transfer_memory_mib = limits.transfer_memory,
+        "Request limits configured"
+    );
+    crate::logging::requests(
+        with_request_limit(router, Arc::new(Admission::new(limits))),
+        component,
+    )
 }
 
 fn with_request_limit(router: Router, admission: Arc<Admission>) -> Router {
@@ -177,7 +196,14 @@ fn with_request_limit(router: Router, admission: Arc<Admission>) -> Router {
                 if request.uri().path() == "/health" {
                     return next.run(request).await;
                 }
-                let Some(permit) = admission.acquire(Admission::weight(&request)).await else {
+                let weight = Admission::weight(&request);
+                let queued = std::time::Instant::now();
+                let Some(permit) = admission.acquire(weight).await else {
+                    tracing::warn!(
+                        reserved_mib = weight.unwrap_or(0),
+                        wait_ms = queued.elapsed().as_millis() as u64,
+                        "Request capacity exhausted"
+                    );
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         [(header::RETRY_AFTER, "1")],
@@ -185,6 +211,11 @@ fn with_request_limit(router: Router, admission: Arc<Admission>) -> Router {
                     )
                         .into_response();
                 };
+                tracing::debug!(
+                    queue_ms = queued.elapsed().as_millis() as u64,
+                    reserved_mib = weight.unwrap_or(0),
+                    "Request admitted"
+                );
                 request.extensions_mut().insert(permit.clone());
                 let (parts, body) = next.run(request).await.into_parts();
                 let stream = body.into_data_stream().map(move |chunk| {
@@ -204,10 +235,14 @@ where
     F: FnOnce(S) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<T>> + Send + 'static,
 {
-    tokio::spawn(async move {
-        let _permit = state.permit;
-        work(state.value).await
-    })
+    let request_id = crate::logging::request_id();
+    tokio::spawn(
+        crate::logging::scope(request_id, async move {
+            let _permit = state.permit;
+            work(state.value).await
+        })
+        .in_current_span(),
+    )
     .await
     .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     .map_err(Into::into)
@@ -241,6 +276,7 @@ pub fn router_with_limits(store: Store, limits: RequestLimits) -> Router {
             .layer(DefaultBodyLimit::max(MAX_BLOB))
             .with_state(store),
         limits,
+        "controller",
     )
 }
 
@@ -250,12 +286,14 @@ pub async fn serve(store: Store, address: &str) -> Result<()> {
 
 pub async fn serve_router(router: Router, address: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
-    eprintln!("scn listening on http://{}", listener.local_addr()?);
+    tracing::info!(address = %listener.local_addr()?, version = env!("CARGO_PKG_VERSION"), "Server listening");
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Shutdown requested; draining requests");
         })
         .await?;
+    tracing::info!("Server stopped");
     Ok(())
 }
 

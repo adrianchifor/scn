@@ -9,7 +9,7 @@ Its stateless controllers, SQLite shards, and S3 storage can potentially scale t
 ![scn architecture: CLI users and AI agents connect to stateless controllers, backed by a persistent Valkey index, independent SQLite shards, and S3 blob storage](docs/architecture.svg)
 
 - **Controllers** run commits, history queries, diff, blame, merge, and rebase. Multiple controllers share one repository without local durable state. Each keeps a bounded, disposable cache of reconstructed trees.
-- **Valkey** holds permanent shard assignments, `main`, and tags, plus compressed blobs with a configurable TTL. AOF and RDB persist the index; `volatile-lru` evicts only expiring cache entries.
+- **Valkey** holds permanent shard assignments, `main`, and tags, plus compressed blobs with a configurable TTL. AOF and RDB persist the index; `volatile-lru` evicts only expiring cache entries. Cache writes skip blobs larger than 1/32 of Valkey’s memory limit.
 - **Shards** store immutable file deltas, commit headers, and verified blob lengths in independent SQLite WAL databases. New paths go to the shard with the fewest assignments. Existing paths never move.
 - **Blob storage** is local disk per shard or a shared S3 bucket. Files over 32 MiB use 8 MiB chunks and a manifest. Chunks are addressed by SHA-256, deduplicated, and Zstandard compressed. New chunks can be distributed across shards.
 
@@ -180,6 +180,20 @@ For S3-compatible services, also pass `--s3-endpoint http://s3-host:9000`. The s
 Use a separate Valkey namespace, shard directories, and bucket prefix per repository. Back up Valkey with the shard databases and blob store.
 
 `scn cache` defaults to `appendfsync always`; `--appendfsync everysec` trades durability for throughput. Authentication and automatic failover are not built in.
+
+## Logging and progress
+
+Servers log requests, timings, retries, storage operations, commits, and ref updates to stderr. Health probes and storage details use debug level. Logs include request IDs that follow controller-to-shard calls; API responses return them in `x-request-id`.
+
+```sh
+RUST_LOG=warn,scn=debug scn --log-format json serve --store /tmp/scn-store
+SCN_LOG_FORMAT=json RUST_LOG=warn,scn=debug docker compose -f deploy/compose.yaml up -d
+scn --no-progress pull
+```
+
+Text logs are the default; `SCN_LOG_FORMAT=json` also selects JSON. Logging uses a bounded background queue, dropping log lines if overloaded. Request bodies, query strings, and authorization headers are omitted.
+
+CLI spinners show staging, transfers, and synchronization in terminals. They clear on completion or failure and are hidden for redirected stderr or JSON logs. Use `--no-progress` to disable them explicitly. Command results and file contents stay on stdout.
 
 ## Import Git history
 

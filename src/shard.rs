@@ -30,6 +30,7 @@ pub fn router_with_limits(local: Local, limits: RequestLimits) -> Router {
             .layer(DefaultBodyLimit::max(MAX_BLOB + 128 * 1024))
             .with_state(local),
         limits,
+        "shard",
     )
 }
 

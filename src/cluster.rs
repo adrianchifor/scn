@@ -21,6 +21,7 @@ pub struct Cluster {
     blob_cache: Vec<ConnectionManager>,
     next_cache: AtomicUsize,
     cache_slots: tokio::sync::Semaphore,
+    cache_blob_limit: usize,
     prefix: String,
     http: Client,
     blob_ttl: u64,
@@ -46,6 +47,30 @@ impl Cluster {
             .set_connection_timeout(Some(Duration::from_secs(5)))
             .set_response_timeout(Some(Duration::from_secs(10)));
         let cache = ConnectionManager::new_with_config(client.clone(), config.clone()).await?;
+        let memory: redis::RedisResult<String> = redis::cmd("INFO")
+            .arg("memory")
+            .query_async(&mut cache.clone())
+            .await;
+        let maximum = memory
+            .as_ref()
+            .ok()
+            .and_then(|memory| {
+                memory
+                    .lines()
+                    .find_map(|line| line.strip_prefix("maxmemory:"))
+            })
+            .and_then(|size| size.trim().parse::<u64>().ok());
+        let cache_blob_limit = match maximum {
+            Some(0) => crate::store::MAX_BLOB + 128 * 1024,
+            Some(maximum) => {
+                (maximum / 32).min((crate::store::MAX_BLOB + 128 * 1024) as u64) as usize
+            }
+            None => {
+                tracing::warn!("Cannot read Valkey memory limit; bypassing optional blob cache");
+                0
+            }
+        };
+        tracing::debug!(maxmemory_bytes = ?maximum, max_cached_blob_bytes = cache_blob_limit, "Blob cache budget configured");
         let blob_cache = futures_util::future::try_join_all(
             (0..4).map(|_| ConnectionManager::new_with_config(client.clone(), config.clone())),
         )
@@ -55,6 +80,7 @@ impl Cluster {
             blob_cache,
             next_cache: AtomicUsize::new(0),
             cache_slots: tokio::sync::Semaphore::new(2),
+            cache_blob_limit,
             prefix: format!("scn:{{{namespace}}}"),
             http: Client::builder()
                 .timeout(Duration::from_secs(120))
@@ -74,6 +100,7 @@ impl Cluster {
                 "expected a shard origin URL"
             );
             Self::response(cluster.http.get(format!("{shard}/health")).send().await?).await?;
+            tracing::info!(shard = %url.origin().ascii_serialization(), namespace, "Registering shard");
             for kind in ["paths", "blobs", "commits"] {
                 redis::cmd("ZADD")
                     .arg(cluster.key(&format!("{kind}:counts")))
@@ -90,6 +117,11 @@ impl Cluster {
                 .await?
                 > 0,
             "register at least one shard with --shard"
+        );
+        tracing::info!(
+            namespace,
+            blob_ttl_seconds = blob_ttl,
+            "Controller connected to shard index"
         );
         Ok(cluster)
     }
@@ -117,7 +149,10 @@ impl Cluster {
     ) -> Result<T> {
         for attempt in 0..2 {
             match command.query_async(&mut connection).await {
-                Err(error) if attempt == 0 && error.is_connection_dropped() => continue,
+                Err(error) if attempt == 0 && error.is_connection_dropped() => {
+                    tracing::warn!("Index connection lost; reconnecting before retrying read");
+                    continue;
+                }
                 result => return Ok(result?),
             }
         }
@@ -146,9 +181,14 @@ impl Cluster {
                     if attempt < 5
                         && (error.is_connection_dropped() || error.code() == Some("OOM")) =>
                 {
+                    tracing::warn!(kind, attempt = attempt + 1, delay_ms = 25u64 << attempt, error = %error, "Retrying shard allocation");
                     tokio::time::sleep(Duration::from_millis(25 << attempt)).await;
                 }
-                result => return Ok(result?),
+                result => {
+                    let shard: String = result?;
+                    tracing::debug!(kind, item, shard = %crate::logging::endpoint(&shard), "Resolved shard allocation");
+                    return Ok(shard);
+                }
             }
         }
         unreachable!()
@@ -165,16 +205,27 @@ impl Cluster {
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<Response> {
+        let request_id = crate::logging::request_id();
+        let request = request
+            .header(crate::logging::REQUEST_ID, &request_id)
+            .build()?;
         for attempt in 0..6 {
-            let response = request
-                .try_clone()
-                .context("request body cannot be retried")?
-                .send()
+            let started = std::time::Instant::now();
+            tracing::debug!(component = "controller", %request_id, method = %request.method(), endpoint = %request.url().origin().ascii_serialization(), path = request.url().path(), attempt = attempt + 1, "Sending HTTP request");
+            let response = self
+                .http
+                .execute(
+                    request
+                        .try_clone()
+                        .context("request body cannot be retried")?,
+                )
                 .await?;
+            tracing::debug!(component = "controller", %request_id, status = response.status().as_u16(), elapsed_ms = started.elapsed().as_millis() as u64, "HTTP response received");
             if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE || attempt == 5 {
                 return Ok(response);
             }
             let delay = retry_delay(response.headers(), attempt);
+            tracing::warn!(component = "controller", %request_id, attempt = attempt + 1, delay_ms = delay.as_millis() as u64, "Server busy; retrying request");
             drop(response);
             tokio::time::sleep(delay).await;
         }
@@ -216,7 +267,9 @@ impl Backend for Cluster {
             .await?,
         )
         .await?;
-        if let Ok(_slot) = self.cache_slots.try_acquire() {
+        if bytes.len() <= self.cache_blob_limit
+            && let Ok(_slot) = self.cache_slots.try_acquire()
+        {
             let _: redis::RedisResult<()> = self
                 .blob_connection()
                 .set_ex(
@@ -231,7 +284,9 @@ impl Backend for Cluster {
 
     async fn blob(&self, id: &str) -> Result<Bytes> {
         let key = self.key(&format!("blob:{id}"));
-        if let Ok(_slot) = self.cache_slots.try_acquire() {
+        if self.cache_blob_limit > 0
+            && let Ok(_slot) = self.cache_slots.try_acquire()
+        {
             let mut connection = self.blob_connection();
             if let Ok(Some(bytes)) = Self::read_connection::<Option<Vec<u8>>>(
                 connection.clone(),
@@ -246,11 +301,18 @@ impl Backend for Cluster {
                 })
                 .await?;
                 if valid {
+                    tracing::debug!(
+                        blob_id = id,
+                        compressed_bytes = bytes.len(),
+                        "Shared blob cache hit"
+                    );
                     return Ok(bytes);
                 }
+                tracing::warn!(blob_id = id, "Discarding corrupt shared blob cache entry");
                 let _: redis::RedisResult<()> = connection.del(&key).await;
             }
         }
+        tracing::debug!(blob_id = id, "Fetching blob from shard");
         let shard = self.blob_shard(id).await?;
         let bytes = Self::response(
             self.send(self.http.get(format!("{shard}/internal/blobs/{id}")))
@@ -265,7 +327,9 @@ impl Backend for Cluster {
             Ok(bytes)
         })
         .await?;
-        if let Ok(_slot) = self.cache_slots.try_acquire() {
+        if bytes.len() <= self.cache_blob_limit
+            && let Ok(_slot) = self.cache_slots.try_acquire()
+        {
             let _: redis::RedisResult<()> = self
                 .blob_connection()
                 .set_ex(key, bytes.as_ref(), self.blob_ttl)
@@ -369,6 +433,7 @@ impl Backend for Cluster {
         for (shard, path, entry) in allocations {
             groups.entry(shard).or_default().insert(path, entry);
         }
+        tracing::debug!(commit_id = %commit.id, shards = groups.len(), paths = commit.changes.len(), "Writing commit across shards");
         stream::iter(groups)
             .map(|(shard, changes)| async move {
                 Self::response(

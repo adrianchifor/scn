@@ -64,6 +64,8 @@ Tags default to `HEAD`; use `-f` to replace. Change tags only when requested: up
 
 Use the controller endpoint supplied to your session. All routes below are relative to it. JSON requests use `Content-Type: application/json`. No working copy, staging area, Git repository, or direct shard access is needed.
 
+Responses include `x-request-id` for debugging. You can supply one using 1–64 ASCII letters, digits, `.`, `_`, or `-`; invalid values are replaced. Include it when reporting a server error. CLI progress stays on stderr; use `--no-progress` to hide it.
+
 - Commit and blob IDs are 64-character lowercase SHA-256 hex strings. Physical blob hashes cover raw bytes before compression.
 - A tree maps repository-relative paths to file entries. Files up to 32 MiB use `{"blob":"BLOB_ID","executable":false}`. Larger files also have `"manifest":{"size":BYTE_LENGTH,"chunks":["CHUNK_ID",...]}`; their `blob` hashes the manifest, not the whole file's raw bytes.
 - `changes` has the same path keys, with file entries for additions/modifications and `null` for deletions. Send only changed paths; omitted paths are preserved from the first parent.
